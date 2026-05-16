@@ -18,6 +18,7 @@ from beaty_common.data_utils import SegmentSampler, device as eval_device
 from beaty_common.eval_utils import evaluate_3p_on_map
 from beaty_common.gen_utils import generate_3p_from_style_embeddings
 from beaty_common.train_utils import nanpad_collate_fn
+from beaty_common.torch_nets2 import CondTransformerGSVAE, GameplayEncoder, SentinelPredictor, TransformerGSVAE
 from xror.xror import XROR
 
 device = torch.device("cuda")
@@ -30,6 +31,18 @@ def main(args, remaining_args):
 
     checkpoint_d = torch.load(args.gen_path, weights_only=False)
     pred_net = pauli.load(checkpoint_d["pred_net_d"])
+    pred_net = CondTransformerGSVAE(
+        note_size=pred_net.note_size,
+        bomb_size=pred_net.bomb_size,
+        obstacle_size=pred_net.obstacle_size,
+        history_size=pred_net.threep_size,
+        hidden_size=pred_net.hidden_size,
+        embed_size=pred_net.embed_size,
+        sentence_length=pred_net.sentence_length,
+        vocab_size=pred_net.vocab_size,
+        num_heads=pred_net.num_heads,
+        num_layers=pred_net.num_layers,
+    )
     pred_net_state_dict = checkpoint_d["pred_net_state_dict"]
     for key in list(pred_net_state_dict.keys()):
         clean_key = key.replace("_orig_mod.", "")
@@ -40,6 +53,17 @@ def main(args, remaining_args):
     print("Loaded pred_net")
 
     gsvae_net = pauli.load(checkpoint_d["gsvae_net_d"])
+    gsvae_net = TransformerGSVAE(
+        input_size=gsvae_net.input_size,
+        hidden_size=gsvae_net.hidden_size,
+        embed_size=gsvae_net.embed_size,
+        vocab_size=gsvae_net.vocab_size,
+        sentence_length=gsvae_net.sentence_length,
+        chunk_length=gsvae_net.chunk_length,
+        stride=gsvae_net.stride,
+        num_heads=gsvae_net.num_heads,
+        num_layers=gsvae_net.num_layers,
+    )
     gsvae_net_state_dict = checkpoint_d["gsvae_net_state_dict"]
     for key in list(gsvae_net_state_dict.keys()):
         clean_key = key.replace("_orig_mod.", "")
@@ -68,6 +92,27 @@ def main(args, remaining_args):
     for i in range(len(loaded_mod_dat)):
         net_state_dict, ema_state_dict, net_d = loaded_mod_dat[i]
         net = pauli.load(net_d)
+        if type(net).__name__ == "GameplayEncoder":
+            net = GameplayEncoder(
+                note_size=net.note_size,
+                bomb_size=net.bomb_size,
+                obstacle_size=net.obstacle_size,
+                history_size=net.threep_size,
+                hidden_size=net.hidden_size,
+                embed_size=net.embed_size,
+                num_heads=net.num_heads,
+                num_layers=net.num_layers,
+            )
+        elif type(net).__name__ == "SentinelPredictor":
+            net = SentinelPredictor(
+                input_size=net.input_size,
+                output_size=net.output_size,
+                hidden_size=net.hidden_size,
+                num_heads=net.num_heads,
+                num_layers=net.num_layers,
+            )
+        else:
+            raise TypeError(f"Unexpected classy module type: {type(net).__name__}")
         for key in list(net_state_dict.keys()):
             clean_key = key.replace("_orig_mod.", "")
             net_state_dict[clean_key] = net_state_dict.pop(key)
