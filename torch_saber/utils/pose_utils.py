@@ -3,7 +3,6 @@ import torch
 
 
 def expm_to_quat(expm: np.ndarray, eps: float = 1e-8):
-    """ """
     half_angle = np.linalg.norm(expm, axis=-1)[..., None]
     c = np.cos(half_angle)
     s = np.sin(half_angle)
@@ -31,7 +30,6 @@ def quat_to_expm_torch(quat: torch.Tensor, eps: float = 1e-8):
 
 
 def expm_to_quat_torch(expm: torch.Tensor, eps: float = 1e-8):
-    """ """
     half_angle = torch.linalg.norm(expm, dim=-1)[..., None]
     c = torch.cos(half_angle)
     s = torch.sin(half_angle)

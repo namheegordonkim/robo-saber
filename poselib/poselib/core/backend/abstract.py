@@ -5,8 +5,7 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-from abc import ABCMeta, abstractmethod, abstractclassmethod
-from collections import OrderedDict
+from abc import abstractmethod, abstractclassmethod
 import json
 
 import numpy as np

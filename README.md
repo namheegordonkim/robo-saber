@@ -18,10 +18,10 @@ Official codebase for Robo-Saber (Eurographics 2026)
 
 ## Installation
 
-### With `uv` (Recommended)
+### With `snakemake` + `uv` (Recommended)
 
 ```bash
-uv run robo-saber/prepare.py
+uv run snakemake prepare
 ```
 
 This downloads the pretrained model snapshot and post-QC manifest for BOXRR-23.
@@ -48,10 +48,20 @@ pip install -r requirements.txt
 
 ## Running the code
 
-### With `uv` (Recommended)
+### With `snakemake` + `uv` (Recommended)
+
+This works best for testing the code out of the box.
 
 ```bash
-uv run robo-saber/generate.py
+uv run snakemake generate
+```
+
+### With `uv`
+
+You can supply custom CLI arguments using
+
+```bash
+uv run robo-saber/generate.py --csv_path [csv_path]...
 ```
 
 ### Without `uv`

@@ -20,7 +20,6 @@ import json
 import uuid
 import struct
 import contextlib
-from collections import defaultdict
 from io import BytesIO as StringIO
 
 __all__ = ('Tilt', 'Sketch', 'Stroke', 'ControlPoint',

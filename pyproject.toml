@@ -35,10 +35,6 @@ gdrive_id = "1oPEKbmxdP-UDYiutjuLxg_NNBi8mo1nT"
 path = "models/classy.pkl"
 
 [[tool.prepare.downloads]]
-gdrive_id = "1AoZAF2l-NvIXStmFMjagOp-2QAinB0z5"
-path = "models/phc.pkl"
-
-[[tool.prepare.downloads]]
 gdrive_id = "18q2pp4Qpn6OVau7WTzQGA-QaTdqNfzZh"
 path = "data/boxrr23_post_qc.csv"
 

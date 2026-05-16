@@ -26,7 +26,6 @@ rule prepare:
     output:
         ccm=PREPARE_PATHS["ccm.pkl"],
         classy=PREPARE_PATHS["classy.pkl"],
-        phc=PREPARE_PATHS["phc.pkl"],
         boxrr23_manifest=PREPARE_PATHS["boxrr23_post_qc.csv"]
     message:
         "Preparing Robo-Saber model files and BOXRR-23 manifest."
@@ -57,3 +56,13 @@ rule generate:
         "--gen_path {input.ccm:q} "
         "--classy_path {input.classy:q} "
         "--boxrr23_manifest_path {input.boxrr23_manifest:q}"
+
+
+rule validate:
+    input:
+        gold="out/gen3p.gold.nc",
+        new=rules.generate.output[0]
+    message:
+        "Comparing out/gen3p.nc against out/gen3p.gold.nc."
+    shell:
+        "uv run tools/compare_gen3p.py {input.gold:q} {input.new:q}"

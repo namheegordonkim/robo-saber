@@ -1,11 +1,8 @@
 """Extended Reality Open Recording (XROR)."""
 
-from signal import signal, SIGSEGV, SIGFPE
-
 import numpy as np
 import fpzip
 import bson
-import time
 import datetime
 from .Bsor import make_bsor
 from .tilt import Tilt

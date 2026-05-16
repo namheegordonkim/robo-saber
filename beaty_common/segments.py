@@ -1,11 +1,8 @@
 from dataclasses import dataclass
-from functools import reduce
 from typing import List
 
 import numpy as np
 import torch
-
-from proj_utils.dirs import proj_dir
 
 
 @dataclass

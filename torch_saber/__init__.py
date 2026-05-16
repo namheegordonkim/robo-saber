@@ -1,1 +1,1 @@
-from torch_saber.torch_saber import TorchSaber
+from torch_saber.torch_saber import TorchSaber as TorchSaber

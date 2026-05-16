@@ -1,7 +1,7 @@
 import glob
 from contextlib import contextmanager
 from queue import Queue
-from threading import Thread, Semaphore
+from threading import Thread
 from typing import Tuple
 
 import numpy as np

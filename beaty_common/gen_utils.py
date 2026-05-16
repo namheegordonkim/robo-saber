@@ -8,7 +8,6 @@ from beaty_common.train_utils import placeholder_3p_sixd, nanpad_collate_fn
 from beaty_common.bsmg_xror_utils import open_bsmg
 from beaty_common.eval_utils import get_njs
 from beaty_common.data_utils import SegmentSampler
-from proj_utils.dirs import proj_dir
 
 
 def generate_3p_work(
