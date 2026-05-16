@@ -11,8 +11,6 @@ PREPARE_PATHS = {
 }
 
 CSV_PATH = config.get("csv_path", "data/for_video.csv")
-DATA_DIR = config.get("data_dir", "/home/nhgk/projects/Beaty/out/1654/002_main_data/")
-REFERENCE_SOURCE = config.get("reference_source", "huggingface")
 TARGET_PLAYER_SOURCE = config.get("target_player_source", "strong_random")
 
 
@@ -24,44 +22,40 @@ rule all:
 
 rule prepare:
     output:
-        ccm=PREPARE_PATHS["ccm.pkl"],
-        classy=PREPARE_PATHS["classy.pkl"],
-        boxrr23_manifest=PREPARE_PATHS["boxrr23_post_qc.csv"]
+        pretrained=PREPARE_PATHS["pretrained.pkl"],
+        boxrr23_manifest=PREPARE_PATHS["boxrr23_post_qc.csv"],
+        heldout_maps=PREPARE_PATHS["heldout_player_maps.csv"],
+        placeholder_sixd=PREPARE_PATHS["placeholder_3p_sixd.txt"],
+        placeholder_3p=PREPARE_PATHS["placeholder_3p.txt"],
     message:
-        "Preparing Robo-Saber model files and BOXRR-23 manifest."
+        "Downloading pretrained model and data manifests from prepare.py (Google Drive)."
     shell:
         "uv run robo-saber/prepare.py"
 
 
 rule generate:
     input:
-        ccm=rules.prepare.output.ccm,
-        classy=rules.prepare.output.classy,
+        pretrained=rules.prepare.output.pretrained,
         boxrr23_manifest=rules.prepare.output.boxrr23_manifest
     output:
         "out/gen3p.nc"
     params:
         csv_path=CSV_PATH,
-        data_dir=DATA_DIR,
-        reference_source=REFERENCE_SOURCE,
-        target_player_source=TARGET_PLAYER_SOURCE
+        target_player_source=TARGET_PLAYER_SOURCE,
     message:
         "Generating 3P trajectories and writing out/gen3p.nc."
     shell:
         "uv run robo-saber/generate.py "
         "--csv_path {params.csv_path:q} "
-        "--data_dir {params.data_dir:q} "
-        "--reference_source {params.reference_source:q} "
         "--target_player_source {params.target_player_source:q} "
-        "--gen_path {input.ccm:q} "
-        "--classy_path {input.classy:q} "
+        "--clean_models_bundle {input.pretrained:q} "
         "--boxrr23_manifest_path {input.boxrr23_manifest:q}"
 
 
 rule validate:
     input:
         gold="out/gen3p.gold.nc",
-        new=rules.generate.output[0]
+        new=rules.generate.output
     message:
         "Comparing out/gen3p.nc against out/gen3p.gold.nc."
     shell:

@@ -3,7 +3,7 @@ import numpy as np
 import torch
 
 from beaty_common.pose_utils import interpolate_xyzsixd
-from torch_saber import TorchSaber
+from vendor.torch_saber import TorchSaber
 from beaty_common.train_utils import placeholder_3p_sixd, nanpad_collate_fn
 from beaty_common.bsmg_xror_utils import open_bsmg
 from beaty_common.eval_utils import get_njs
@@ -162,58 +162,6 @@ def generate_3p_work(
     # generated_cands = torch.cat(generated_cands, dim=2)
     generated_cands = torch.cat(generated_cands[history_len:], dim=2)
     return generated_3p, generated_cands
-
-
-def generate_3p(
-    device,
-    execution_horizon,
-    game_segments,
-    playstyle_notes: torch.Tensor,
-    playstyle_bombs: torch.Tensor,
-    playstyle_obstacles: torch.Tensor,
-    playstyle_history: torch.Tensor,
-    playstyle_3p: torch.Tensor,
-    gsvae_net,
-    history_len,
-    length,
-    pred_net,
-    stride,
-    note_profiles,
-    bomb_profiles,
-    obstacle_profiles,
-    argmax_yes,
-    gt_3p,
-    njs,
-    n_cands: int,
-    temperature: float,
-):
-    playstyle_tokens, playstyle_mask = pred_net.encode_style(
-        playstyle_notes,
-        playstyle_bombs,
-        playstyle_obstacles,
-        playstyle_history,
-        playstyle_3p,
-    )
-    return generate_3p_work(
-        device,
-        execution_horizon,
-        game_segments,
-        gsvae_net,
-        history_len,
-        length,
-        pred_net,
-        stride,
-        note_profiles,
-        bomb_profiles,
-        obstacle_profiles,
-        argmax_yes,
-        gt_3p,
-        njs,
-        playstyle_tokens,
-        playstyle_mask,
-        n_cands,
-        temperature,
-    )
 
 
 def generate_3p_from_style_embeddings(

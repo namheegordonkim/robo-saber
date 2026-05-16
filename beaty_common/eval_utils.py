@@ -1,32 +1,10 @@
 import numpy as np
 import torch
-from datasets import Dataset
 
 from beaty_common.bsmg_xror_utils import open_beatmap_from_unpacked_xror, load_cbo_and_3p, device, get_cbo_np
 from beaty_common.data_utils import SegmentSampler
 from beaty_common.train_utils import nanpad_collate_fn
-from torch_saber import TorchSaber
-from xror.xror import XROR
-
-
-# def evaluate_boxrr_row(arrow_files, x, left_handed=False):
-#     xror_unpacked = get_xror_for_row(arrow_files, x)
-#     return evaluate_row_against_accompanying_map(xror_unpacked, left_handed=left_handed)
-
-
-def get_xror_for_row(arrow_files, x):
-    shard_idx = x["Shard Index"]
-    datapoint_idx = x["Datapoint Index"]
-    shard_file = arrow_files[shard_idx]
-    ds = Dataset.from_file(shard_file)
-    xror_unpacked = XROR.unpack(ds[datapoint_idx]["xror"])
-    return xror_unpacked
-
-
-def evaluate_row_against_accompanying_map(arrow_files, x, left_handed=False):
-    xror_unpacked = get_xror_for_row(arrow_files, x)
-    beatmap, map_info = open_beatmap_from_unpacked_xror(xror_unpacked)
-    return evaluate_xror_on_map(xror_unpacked, beatmap, map_info, left_handed=left_handed)
+from vendor.torch_saber import TorchSaber
 
 
 def evaluate_3p_on_map(_3p, difficulty, characteristic, beatmap, map_info, song_duration, left_handed=False):

@@ -12,14 +12,10 @@ line-length = 1000000
 dependencies = { file = ["requirements.txt"] }
 
 [tool.setuptools.packages.find]
+where = ["."]
 include = [
-    "pauli*",
     "beaty_common*",
-    "proj_utils*",
-    "torch_saber*",
-    "xror*",
-    "poselib*",
-    "train*",
+    "vendor*",
 ]
 
 [build-system]
@@ -27,12 +23,8 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [[tool.prepare.downloads]]
-gdrive_id = "1cD3Xpmd85k30Q4QDQO2Xvu5LejqKfU2u"
-path = "models/ccm.pkl"
-
-[[tool.prepare.downloads]]
-gdrive_id = "1oPEKbmxdP-UDYiutjuLxg_NNBi8mo1nT"
-path = "models/classy.pkl"
+gdrive_id = "1TqJBxNk7LEBh7EqcU11tON5Couxiid1c"
+path = "models/pretrained.pkl"
 
 [[tool.prepare.downloads]]
 gdrive_id = "18q2pp4Qpn6OVau7WTzQGA-QaTdqNfzZh"

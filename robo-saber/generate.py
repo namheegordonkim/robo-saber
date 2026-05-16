@@ -10,101 +10,47 @@ import requests
 import torch
 import xarray as xr
 from tqdm import tqdm
-
-import pauli
 from beaty_common.bsmg_xror_utils import get_cbo_np, load_cbo_and_3p, open_beatmap_from_bsmg_or_boxrr
 from beaty_common.data_utils import SegmentSampler, device as eval_device
 from beaty_common.eval_utils import evaluate_3p_on_map
 from beaty_common.gen_utils import generate_3p_from_style_embeddings
 from beaty_common.train_utils import nanpad_collate_fn
 from beaty_common.torch_nets2 import CondTransformerGSVAE, GameplayEncoder, SentinelPredictor, TransformerGSVAE
-from xror.xror import XROR
+from vendor.xror.xror import XROR
 
 device = torch.device("cuda")
 user_tar_cache = {}
 
+DEFAULT_CLEAN_SNAPSHOT_PATH = os.path.normpath("models/pretrained.pkl")
 
-def load_models(args):
-    checkpoint_d = torch.load(args.gen_path, weights_only=False)
 
-    pred_net = pauli.load(checkpoint_d["pred_net_d"])
-    pred_net = CondTransformerGSVAE(
-        note_size=pred_net.note_size,
-        bomb_size=pred_net.bomb_size,
-        obstacle_size=pred_net.obstacle_size,
-        history_size=pred_net.threep_size,
-        hidden_size=pred_net.hidden_size,
-        embed_size=pred_net.embed_size,
-        sentence_length=pred_net.sentence_length,
-        vocab_size=pred_net.vocab_size,
-        num_heads=pred_net.num_heads,
-        num_layers=pred_net.num_layers,
-    )
-    pred_net_state_dict = checkpoint_d["pred_net_state_dict"]
-    for key in list(pred_net_state_dict.keys()):
-        clean_key = key.replace("_orig_mod.", "")
-        pred_net_state_dict[clean_key] = pred_net_state_dict.pop(key)
-    pred_net.load_state_dict(pred_net_state_dict)
+def load_models(bundle_path):
+    """Load the four nets from a single ``torch.save`` bundle (ctor kwargs + ``state_dict`` tensors)."""
+    bundle = torch.load(bundle_path, map_location="cpu", weights_only=False)
+
+    pred_net = CondTransformerGSVAE(**bundle["pred_kw"])
+    pred_net.load_state_dict(bundle["pred_sd"], strict=True)
     pred_net = pred_net.to(device).eval().requires_grad_(False)
 
-    gsvae_net = pauli.load(checkpoint_d["gsvae_net_d"])
-    gsvae_net = TransformerGSVAE(
-        input_size=gsvae_net.input_size,
-        hidden_size=gsvae_net.hidden_size,
-        embed_size=gsvae_net.embed_size,
-        vocab_size=gsvae_net.vocab_size,
-        sentence_length=gsvae_net.sentence_length,
-        chunk_length=gsvae_net.chunk_length,
-        stride=gsvae_net.stride,
-        num_heads=gsvae_net.num_heads,
-        num_layers=gsvae_net.num_layers,
-    )
-    gsvae_net_state_dict = checkpoint_d["gsvae_net_state_dict"]
-    for key in list(gsvae_net_state_dict.keys()):
-        clean_key = key.replace("_orig_mod.", "")
-        gsvae_net_state_dict[clean_key] = gsvae_net_state_dict.pop(key)
-    gsvae_net.load_state_dict(gsvae_net_state_dict)
+    gsvae_net = TransformerGSVAE(**bundle["gsvae_kw"])
+    gsvae_net.load_state_dict(bundle["gsvae_sd"], strict=True)
     gsvae_net = gsvae_net.to(device).eval().requires_grad_(False)
 
-    classy_checkpoint_dict = torch.load(args.classy_path, weights_only=False)
-    emas = []
-    for net_state_dict, ema_state_dict, net_d in classy_checkpoint_dict["mod_dat"]:
-        net = pauli.load(net_d)
-        if type(net).__name__ == "GameplayEncoder":
-            net = GameplayEncoder(
-                note_size=net.note_size,
-                bomb_size=net.bomb_size,
-                obstacle_size=net.obstacle_size,
-                history_size=net.threep_size,
-                hidden_size=net.hidden_size,
-                embed_size=net.embed_size,
-                num_heads=net.num_heads,
-                num_layers=net.num_layers,
-            )
-        elif type(net).__name__ == "SentinelPredictor":
-            net = SentinelPredictor(
-                input_size=net.input_size,
-                output_size=net.output_size,
-                hidden_size=net.hidden_size,
-                num_heads=net.num_heads,
-                num_layers=net.num_layers,
-            )
-        else:
-            raise TypeError(f"Unexpected classy module type: {type(net).__name__}")
-        for key in list(ema_state_dict.keys()):
-            clean_key = key.replace("_orig_mod.", "")
-            ema_state_dict[clean_key] = ema_state_dict.pop(key)
-        net.load_state_dict(ema_state_dict)
-        emas.append(net.to(eval_device).eval().requires_grad_(False))
-    classy_enc_ema, classy_head_ema = emas
+    classy_enc_ema = GameplayEncoder(**bundle["classy_enc_kw"])
+    classy_enc_ema.load_state_dict(bundle["classy_enc_sd"], strict=True)
+    classy_enc_ema = classy_enc_ema.to(eval_device).eval().requires_grad_(False)
+
+    classy_head_ema = SentinelPredictor(**bundle["classy_head_kw"])
+    classy_head_ema.load_state_dict(bundle["classy_head_sd"], strict=True)
+    classy_head_ema = classy_head_ema.to(eval_device).eval().requires_grad_(False)
 
     return {
         "pred_net": pred_net,
         "gsvae_net": gsvae_net,
         "classy_enc_ema": classy_enc_ema,
         "classy_head_ema": classy_head_ema,
-        "chunk_length": checkpoint_d["args"].chunk_length,
-        "history_len": checkpoint_d["args"].history_len,
+        "chunk_length": int(bundle["chunk_length"]),
+        "history_len": int(bundle["history_len"]),
     }
 
 
@@ -284,10 +230,14 @@ def write_record(nc_out_path, outputs_written, generated_3p, generated_cands, me
 def main(args, remaining_args):
     outdir = "out"
     os.makedirs(outdir, exist_ok=True)
-    nc_out_path = f"{outdir}/gen3p.nc"
+    nc_out_path = args.nc_out_path
+    nc_parent = os.path.dirname(os.path.abspath(nc_out_path))
+    if nc_parent:
+        os.makedirs(nc_parent, exist_ok=True)
 
-    models = load_models(args)
-    print("Loaded models")
+    bundle_path = args.clean_models_bundle
+    models = load_models(bundle_path)
+    print(f"Loaded models from inference snapshot {bundle_path!r}")
     print("Loading manifest...")
     df, target_player_ids, id_to_class_idx = load_data(args)
 
@@ -353,9 +303,23 @@ def main(args, remaining_args):
 if __name__ == "__main__":
     parser = ArgumentParser(allow_abbrev=False)
     parser.add_argument("--csv_path", type=str, required=True)
-    parser.add_argument("--gen_path", type=str, default="models/ccm.pkl")
-    parser.add_argument("--classy_path", type=str, default="models/classy.pkl")
     parser.add_argument("--boxrr23_manifest_path", type=str, default="data/boxrr23_post_qc.csv")
     parser.add_argument("--target_player_source", type=str, default="strong_random", choices=["strong_random", "csv"])
+    parser.add_argument(
+        "--clean_models_bundle",
+        type=str,
+        default=DEFAULT_CLEAN_SNAPSHOT_PATH,
+        metavar="PATH",
+        help=(
+            "Single-file inference bundle (typically ``prepare.py`` -> models/pretrained.pkl). "
+            f"Default: {DEFAULT_CLEAN_SNAPSHOT_PATH!r}."
+        ),
+    )
+    parser.add_argument(
+        "--nc_out_path",
+        type=str,
+        default="out/gen3p.nc",
+        help="NetCDF output path (default: out/gen3p.nc).",
+    )
     args, remaining_args = parser.parse_known_args()
     main(args, remaining_args)

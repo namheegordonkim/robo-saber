@@ -29,16 +29,3 @@ class TensorUtils(Serializable):
         :rtype: OrderedDict
         """
         return NotImplemented
-
-def tensor_to_dict(x):
-    """ Construct an ordered dictionary from the object
-    
-    :rtype: OrderedDict
-    """
-    x_np = x.numpy()
-    return {
-        "arr": x_np,
-        "context": {
-            "dtype": x_np.dtype.name
-        }
-    }

@@ -12,8 +12,7 @@ from scipy.signal import find_peaks
 from scipy.spatial.transform import Rotation
 from scipy.stats import gaussian_kde
 
-from proj_utils.dirs import proj_dir
-from xror.xror import XROR
+from vendor.xror.xror import XROR
 
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
@@ -236,7 +235,7 @@ def open_beatmap_from_unpacked_xror(xror):
             9: "ExpertPlus",
         }[difficulty]
     song_hash = xror.data["info"]["software"]["activity"]["songHash"]
-    zip_path = os.path.join(proj_dir, "datasets", "BeatSaver", f"{song_hash}.zip")
+    zip_path = os.path.join("data", "BeatSaver", f"{song_hash}.zip")
     return open_beatmap_from_bsmg_or_boxrr(zip_path, None, difficulty)[:2]
 
 
@@ -256,44 +255,6 @@ def get_beatsaver_data(song_hashes):
     if len(song_hashes) == 1:
         return {song_hashes[0]: beatsaver_data}
     return beatsaver_data
-
-
-def beats_to_seconds_numpy(beats, tempo_changes):
-    """
-    Vectorized beat → seconds conversion with tempo changes.
-
-    Parameters
-    ----------
-    beats : array_like
-        Beat indices to convert.
-    tempo_changes : list of (beat, bpm)
-        Tempo changes, sorted by beat. bpm is in beats per minute.
-
-    Returns
-    -------
-    np.ndarray
-        Times in seconds corresponding to each beat.
-    """
-    beats = np.asarray(beats, dtype=float)
-    tempo_changes = sorted(tempo_changes, key=lambda x: x[0])
-
-    change_beats = np.array([b for b, _ in tempo_changes], dtype=float)
-    change_bpms = np.array([t for _, t in tempo_changes], dtype=float)
-    sec_per_beat = 60.0 / change_bpms
-
-    # cumulative seconds up to each tempo change
-    cumulative_sec = np.zeros_like(change_beats)
-    cumulative_sec[0] = 0.0
-    for i in range(1, len(change_beats)):
-        duration_beats = change_beats[i] - change_beats[i - 1]
-        cumulative_sec[i] = cumulative_sec[i - 1] + duration_beats * sec_per_beat[i - 1]
-
-    # find which tempo segment each beat falls into
-    idx = np.searchsorted(change_beats, beats, side="right") - 1
-
-    # compute seconds
-    times = cumulative_sec[idx] + (beats - change_beats[idx]) * sec_per_beat[idx]
-    return times
 
 
 def get_cbo_np(beatmap, map_info, left_handed_yes=False):

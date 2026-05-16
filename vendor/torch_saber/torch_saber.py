@@ -8,8 +8,9 @@ from scipy.spatial.transform import Rotation
 from torch import cosine_similarity
 
 from beaty_common.pose_utils import sixd_to_quat
-from poselib.poselib import quat_inverse
-from torch_saber.utils.pose_utils import unity_to_zup, quat_rotate
+from vendor.poselib.poselib import quat_inverse
+
+from .utils.pose_utils import unity_to_zup, quat_rotate
 
 torch.set_printoptions(precision=3, sci_mode=False)
 
@@ -24,26 +25,6 @@ note_y_offset = 0.0
 note_z_offset = 0.0
 
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-
-
-def nanmin_(tensor, dim=None, keepdim=False):
-    max_value = torch.finfo(tensor.dtype).max
-    allnan = tensor.isnan().all(dim=dim)
-    tensor = tensor.nan_to_num_(
-        max_value,
-    ).min(
-        dim=dim, keepdim=keepdim
-    )[0]
-    tensor[allnan] = torch.nan
-    return tensor
-
-
-def nanmax_(tensor, dim=None, keepdim=False):
-    min_value = torch.finfo(tensor.dtype).min
-    allnan = tensor.isnan().all(dim=dim)
-    tensor = tensor.nan_to_num_(min_value).max(dim=dim, keepdim=keepdim)[0]
-    tensor[allnan] = torch.nan
-    return tensor
 
 
 class TorchSaber:

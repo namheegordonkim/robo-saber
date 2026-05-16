@@ -24,11 +24,6 @@ def register(name):
     return core
 
 
-def _get_cls(name):
-    global TENSOR_CLASS
-    return TENSOR_CLASS[name]
-
-
 class NumpyEncoder(json.JSONEncoder):
     """ Special json encoder for numpy types """
 
