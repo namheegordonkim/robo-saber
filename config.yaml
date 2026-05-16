@@ -1,0 +1,2 @@
+csv_path: data/heldout_player_maps.csv
+target_player_source: csv

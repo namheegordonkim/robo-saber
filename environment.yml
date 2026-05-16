@@ -1,0 +1,8 @@
+name: robo-saber
+channels:
+  - defaults
+dependencies:
+  - python=3.11.13
+  - pip
+  - pip:
+    - -e .

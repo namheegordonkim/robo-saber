@@ -1,0 +1,55 @@
+[project]
+name = "robo-saber"
+version = "0.1.0"
+description = "Robo-Saber: Generating and Simulating VR Players"
+requires-python = "==3.11.*"
+dynamic = ["dependencies"]
+
+[tool.black]
+line-length = 1000000
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+include = [
+    "pauli*",
+    "beaty_common*",
+    "proj_utils*",
+    "torch_saber*",
+    "xror*",
+    "poselib*",
+    "train*",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[[tool.prepare.downloads]]
+gdrive_id = "1cD3Xpmd85k30Q4QDQO2Xvu5LejqKfU2u"
+path = "models/ccm.pkl"
+
+[[tool.prepare.downloads]]
+gdrive_id = "1oPEKbmxdP-UDYiutjuLxg_NNBi8mo1nT"
+path = "models/classy.pkl"
+
+[[tool.prepare.downloads]]
+gdrive_id = "1AoZAF2l-NvIXStmFMjagOp-2QAinB0z5"
+path = "models/phc.pkl"
+
+[[tool.prepare.downloads]]
+gdrive_id = "18q2pp4Qpn6OVau7WTzQGA-QaTdqNfzZh"
+path = "data/boxrr23_post_qc.csv"
+
+[[tool.prepare.downloads]]
+gdrive_id = "1cZnD0ChtV7lwqUt_RU8HZuo8zWjd6r7H"
+path = "data/heldout_player_maps.csv"
+
+[[tool.prepare.downloads]]
+gdrive_id = "1cC7aZwjhoHSyZtmHz6UBiby8w7KSGsom"
+path = "data/placeholder_3p_sixd.txt"
+
+[[tool.prepare.downloads]]
+gdrive_id = "1xJBFYTCzaGzlyShhxH39Jn3lqTOrEb0b"
+path = "data/placeholder_3p.txt"
