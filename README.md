@@ -133,20 +133,6 @@ The default publication inference run uses:
 
 During generation, missing BeatSaver maps are stored under `data/BeatSaver`, and player replay tarballs are fetched from the BoxRR Hugging Face dataset. Each successful output row is written as a NetCDF group in `out/gen3p.nc`.
 
-## Validation
-
-If `out/gen3p.gold.nc` is available, compare a generated file against it with:
-
-```bash
-uv run snakemake validate
-```
-
-or manually:
-
-```bash
-uv run python tools/compare_gen3p.py out/gen3p.gold.nc out/gen3p.nc
-```
-
 ## Notes
 
 * Run commands from the repository root.

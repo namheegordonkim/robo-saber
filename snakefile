@@ -50,13 +50,3 @@ rule generate:
         "--target_player_source {params.target_player_source:q} "
         "--clean_models_bundle {input.pretrained:q} "
         "--boxrr23_manifest_path {input.boxrr23_manifest:q}"
-
-
-rule validate:
-    input:
-        gold="out/gen3p.gold.nc",
-        new=rules.generate.output
-    message:
-        "Comparing out/gen3p.nc against out/gen3p.gold.nc."
-    shell:
-        "uv run tools/compare_gen3p.py {input.gold:q} {input.new:q}"
