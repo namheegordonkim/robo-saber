@@ -6,6 +6,7 @@ from scipy.spatial.transform import Rotation
 from torch import cosine_similarity
 
 from beaty_common.pose_utils import sixd_to_quat
+from beaty_common.torch_nets import MapTensors, ReplayTensors
 from vendor.poselib.poselib import quat_inverse
 
 from .utils.pose_utils import quat_rotate, unity_to_zup
@@ -30,15 +31,8 @@ class TorchSaber:
     def evaluate_and_simulate(
         carry_3p: torch.Tensor,
         my_3p_traj: torch.Tensor,
-        note_bags: torch.Tensor,
-        bomb_bags: torch.Tensor,
-        obstacle_bags: torch.Tensor,
-        note_ids: torch.Tensor,
-        bomb_ids: torch.Tensor,
-        obstacle_ids: torch.Tensor,
-        note_profiles: torch.Tensor,
-        bomb_profiles: torch.Tensor,
-        obstacle_profiles: torch.Tensor,
+        replay: ReplayTensors,
+        map_profiles: MapTensors,
         note_alive_mask: torch.Tensor,
         player_height: float,
         njs: float,
@@ -55,15 +49,8 @@ class TorchSaber:
         ) = TorchSaber.simulate(
             carry_3p,
             my_3p_traj,
-            note_bags,
-            bomb_bags,
-            obstacle_bags,
-            note_ids,
-            bomb_ids,
-            obstacle_ids,
-            note_profiles,
-            bomb_profiles,
-            obstacle_profiles,
+            replay,
+            map_profiles,
             player_height,
             njs,
             batch_size,
@@ -179,19 +166,15 @@ class TorchSaber:
     def simulate(
         carry_3p: torch.Tensor,
         my_3p_traj: torch.Tensor,
-        note_bags: torch.Tensor,
-        bomb_bags: torch.Tensor,
-        obstacle_bags: torch.Tensor,
-        note_ids: torch.Tensor,
-        bomb_ids: torch.Tensor,
-        obstacle_ids: torch.Tensor,
-        note_profiles: torch.Tensor,
-        bomb_profiles: torch.Tensor,
-        obstacle_profiles: torch.Tensor,
+        replay: ReplayTensors,
+        map_profiles: MapTensors,
         player_height: float,
         njs: float,
         batch_size: int = None,
     ):
+        assert replay.note_ids is not None
+        assert replay.bomb_ids is not None
+        assert replay.obstacle_ids is not None
         frame_batches = torch.split(
             torch.arange(my_3p_traj.shape[2], device=device),
             batch_size if batch_size is not None else my_3p_traj.shape[2],
@@ -205,11 +188,19 @@ class TorchSaber:
         bad_cut_batches = []
         cut_angle_batches = []
 
-        unique_note_ids = torch.arange(note_profiles.shape[1], device=device)
-        unique_bomb_ids = torch.arange(bomb_profiles.shape[1], device=device)
-        unique_obstacle_ids = torch.arange(obstacle_profiles.shape[1], device=device)
+        unique_note_ids = torch.arange(map_profiles.notes.shape[1], device=device)
+        unique_bomb_ids = torch.arange(map_profiles.bombs.shape[1], device=device)
+        unique_obstacle_ids = torch.arange(map_profiles.obstacles.shape[1], device=device)
 
         for frame_batch in frame_batches:
+            replay_window = ReplayTensors(
+                replay.notes[:, :, frame_batch],
+                replay.bombs[:, :, frame_batch],
+                replay.obstacles[:, :, frame_batch],
+                note_ids=replay.note_ids[:, :, frame_batch],
+                bomb_ids=replay.bomb_ids[:, :, frame_batch],
+                obstacle_ids=replay.obstacle_ids[:, :, frame_batch],
+            )
             (
                 note_appeared_mask,
                 bomb_appeared_mask,
@@ -221,12 +212,7 @@ class TorchSaber:
             ) = TorchSaber.get_collision_masks(
                 carry_3p,
                 my_3p_traj[:, :, frame_batch],
-                note_bags[:, :, frame_batch],
-                bomb_bags[:, :, frame_batch],
-                obstacle_bags[:, :, frame_batch],
-                note_ids[:, :, frame_batch],
-                bomb_ids[:, :, frame_batch],
-                obstacle_ids[:, :, frame_batch],
+                replay_window,
                 player_height,
                 unique_note_ids,
                 unique_bomb_ids,
@@ -402,18 +388,23 @@ class TorchSaber:
     def get_collision_masks(
         carry_3p: torch.Tensor,
         my_3p_traj: torch.Tensor,
-        note_bags: torch.Tensor,
-        bomb_bags: torch.Tensor,
-        obstacle_bags: torch.Tensor,
-        note_ids: torch.Tensor,
-        bomb_ids: torch.Tensor,
-        obstacle_ids: torch.Tensor,
+        replay: ReplayTensors,
         player_height: float,
         unique_note_ids: torch.Tensor,
         unique_bomb_ids: torch.Tensor,
         unique_obstacle_ids: torch.Tensor,
         njs: float,
     ):
+        assert replay.note_ids is not None
+        assert replay.bomb_ids is not None
+        assert replay.obstacle_ids is not None
+        note_bags = replay.notes
+        bomb_bags = replay.bombs
+        obstacle_bags = replay.obstacles
+        note_ids = replay.note_ids
+        bomb_ids = replay.bomb_ids
+        obstacle_ids = replay.obstacle_ids
+
         n_songs, n_cands, n_frames = my_3p_traj.shape[:3]
         n_notes = note_bags.shape[-2]
         full_trajectory = torch.cat([carry_3p, my_3p_traj], dim=2)

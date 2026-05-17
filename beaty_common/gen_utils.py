@@ -7,7 +7,7 @@ from beaty_common.data_utils import sample_for_evaluation
 from beaty_common.eval_utils import get_njs
 from beaty_common.pose_utils import interpolate_xyzsixd
 from beaty_common.train_utils import nanpad_collate_fn, placeholder_3p_sixd
-from beaty_common.torch_nets import GameTensors
+from beaty_common.torch_nets import GameTensors, MapTensors, ReplayTensors
 from vendor.torch_saber import TorchSaber
 
 PLAYER_HEIGHT = 1.5044
@@ -26,9 +26,7 @@ def generate_3p_work(
     length,
     style_predictor,
     stride,
-    note_profiles,
-    bomb_profiles,
-    obstacle_profiles,
+    map_profiles,
     argmax_yes,
     note_jump_speed,
     playstyle_tokens: torch.Tensor,
@@ -39,7 +37,7 @@ def generate_3p_work(
 ):
     generated_windows = [torch.as_tensor(placeholder_3p_sixd[None, None], device=device) for frame_index in range(history_length)]
     note_alive_mask = torch.ones(
-        (sampled_song.notes.shape[0], n_cands, note_profiles.shape[1]),
+        (sampled_song.notes.shape[0], n_cands, map_profiles.notes.shape[1]),
         dtype=torch.bool,
         device=device,
     )
@@ -90,6 +88,14 @@ def generate_3p_work(
             stop_frame = min(frame_index + candidate_trajectories.shape[-3], length)
             carry_state = history_window[:, None, [-1]].unflatten(-1, (3, -1))
             carry_state = carry_state.repeat(1, candidate_trajectories.shape[1], 1, 1, 1)
+            candidate_replay = ReplayTensors(
+                sampled_song.notes[:, frame_index:stop_frame][:, None].repeat_interleave(n_cands, 1),
+                sampled_song.bombs[:, frame_index:stop_frame][:, None].repeat_interleave(n_cands, 1),
+                sampled_song.obstacles[:, frame_index:stop_frame][:, None].repeat_interleave(n_cands, 1),
+                note_ids=sampled_song.note_ids[:, frame_index:stop_frame][:, None].repeat_interleave(n_cands, 1),
+                bomb_ids=sampled_song.bomb_ids[:, frame_index:stop_frame][:, None].repeat_interleave(n_cands, 1),
+                obstacle_ids=sampled_song.obstacle_ids[:, frame_index:stop_frame][:, None].repeat_interleave(n_cands, 1),
+            )
             (
                 normalized_score,
                 n_opportunities,
@@ -102,15 +108,8 @@ def generate_3p_work(
             ) = TorchSaber.evaluate_and_simulate(
                 carry_state,
                 candidate_trajectories[:, :, : stop_frame - frame_index],
-                sampled_song.notes[:, frame_index:stop_frame][:, None].repeat_interleave(n_cands, 1),
-                sampled_song.bombs[:, frame_index:stop_frame][:, None].repeat_interleave(n_cands, 1),
-                sampled_song.obstacles[:, frame_index:stop_frame][:, None].repeat_interleave(n_cands, 1),
-                sampled_song.note_ids[:, frame_index:stop_frame][:, None].repeat_interleave(n_cands, 1),
-                sampled_song.bomb_ids[:, frame_index:stop_frame][:, None].repeat_interleave(n_cands, 1),
-                sampled_song.obstacle_ids[:, frame_index:stop_frame][:, None].repeat_interleave(n_cands, 1),
-                note_profiles,
-                bomb_profiles,
-                obstacle_profiles,
+                candidate_replay,
+                map_profiles,
                 note_alive_mask,
                 PLAYER_HEIGHT,
                 note_jump_speed,
@@ -165,13 +164,11 @@ def generate_3p_from_style_embeddings(
     for name, value in collated.items():
         collated[name] = value.to(device=device)
 
-    note_profiles = collated["notes_np"]
-    bomb_profiles = collated["bombs_np"]
-    obstacle_profiles = collated["obstacles_np"]
+    map_profiles = MapTensors(collated["notes_np"], collated["bombs_np"], collated["obstacles_np"])
     sampled_song = sample_for_evaluation(
-        note_profiles,
-        bomb_profiles,
-        obstacle_profiles,
+        map_profiles.notes,
+        map_profiles.bombs,
+        map_profiles.obstacles,
         collated["timestamps"],
         collated["lengths"],
         length,
@@ -194,9 +191,7 @@ def generate_3p_from_style_embeddings(
         length,
         style_predictor,
         stride,
-        note_profiles,
-        bomb_profiles,
-        obstacle_profiles,
+        map_profiles,
         argmax_yes,
         note_jump_speed,
         playstyle_tokens,

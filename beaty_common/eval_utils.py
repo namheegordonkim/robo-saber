@@ -4,6 +4,7 @@ import torch
 from beaty_common.bsmg_xror_utils import device, get_cbo_np
 from beaty_common.data_utils import sample_for_evaluation
 from beaty_common.train_utils import nanpad_collate_fn
+from beaty_common.torch_nets import MapTensors, ReplayTensors
 from vendor.torch_saber import TorchSaber
 
 EVALUATION_SEGMENT_LENGTH = 72
@@ -50,6 +51,14 @@ def evaluate_3p_on_map(trajectory_3p, difficulty, characteristic, beatmap, map_i
         EVALUATION_FLOOR_TIME,
     )
     note_jump_speed = get_njs(map_info, difficulty, characteristic)
+    simulation_replay = ReplayTensors(
+        sampled_map.notes[:, None],
+        sampled_map.bombs[:, None],
+        sampled_map.obstacles[:, None],
+        note_ids=sampled_map.note_ids[:, None],
+        bomb_ids=sampled_map.bomb_ids[:, None],
+        obstacle_ids=sampled_map.obstacle_ids[:, None],
+    )
 
     (
         note_appeared_mask,
@@ -62,15 +71,8 @@ def evaluate_3p_on_map(trajectory_3p, difficulty, characteristic, beatmap, map_i
     ) = TorchSaber.simulate(
         trajectory_3p[:, :, [0]],
         trajectory_3p,
-        sampled_map.notes[:, None],
-        sampled_map.bombs[:, None],
-        sampled_map.obstacles[:, None],
-        sampled_map.note_ids[:, None],
-        sampled_map.bomb_ids[:, None],
-        sampled_map.obstacle_ids[:, None],
-        collated["notes_np"],
-        collated["bombs_np"],
-        collated["obstacles_np"],
+        simulation_replay,
+        MapTensors(collated["notes_np"], collated["bombs_np"], collated["obstacles_np"]),
         PLAYER_HEIGHT,
         note_jump_speed,
         SIMULATION_BATCH_SIZE,

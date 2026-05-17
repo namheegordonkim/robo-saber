@@ -61,6 +61,22 @@ class ReplayTensors:
             assert self.obstacle_ids.shape == self.obstacles.shape[:-1]
 
 
+@dataclass(slots=True)
+class MapTensors:
+    notes: torch.Tensor
+    bombs: torch.Tensor
+    obstacles: torch.Tensor
+
+    def __post_init__(self):
+        for name, value in (
+            ("notes", self.notes),
+            ("bombs", self.bombs),
+            ("obstacles", self.obstacles),
+        ):
+            assert isinstance(value, torch.Tensor), f"Expected {name} to be a torch.Tensor"
+        assert self.notes.shape[:1] == self.bombs.shape[:1] == self.obstacles.shape[:1]
+
+
 def gumbel_softmax(
     logits: torch.Tensor,
     tau: float = 1.0,
