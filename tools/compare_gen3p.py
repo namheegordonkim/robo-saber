@@ -19,16 +19,16 @@ RTOL = 1e-4
 ATOL = 1e-5
 
 
-def list_groups(path):
+def list_groups(path: str) -> list[str]:
     with h5py.File(path, "r") as f:
         return sorted(f.keys(), key=lambda k: (len(k), k))
 
 
-def open_group(path, group):
+def open_group(path: str, group: str) -> xr.Dataset:
     return xr.open_dataset(path, group=group, engine="h5netcdf")
 
 
-def compare_group(group, ds_a, ds_b):
+def compare_group(group: str, ds_a: xr.Dataset, ds_b: xr.Dataset) -> bool:
     fail = False
 
     var_names = sorted(set(ds_a.data_vars) | set(ds_b.data_vars))
@@ -69,7 +69,7 @@ def compare_group(group, ds_a, ds_b):
     return fail
 
 
-def main():
+def main() -> None:
     if len(sys.argv) != 3:
         print(f"usage: {sys.argv[0]} <gold.nc> <new.nc>", file=sys.stderr)
         sys.exit(2)

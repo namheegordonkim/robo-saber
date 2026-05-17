@@ -2,7 +2,9 @@ import glob
 import io
 import os
 import tarfile
-from argparse import ArgumentParser
+from argparse import ArgumentParser, Namespace
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -14,7 +16,7 @@ from tqdm import tqdm
 from beaty_common.bsmg_xror_utils import get_cbo_np, load_cbo_and_3p, open_beatmap_from_bsmg_or_boxrr
 from beaty_common.data_utils import device as eval_device, sample_for_training
 from beaty_common.eval_utils import evaluate_3p_on_map
-from beaty_common.gen_utils import generate_3p_from_style_embeddings
+from beaty_common.gen_utils import PlaystyleTensors, generate_3p_from_style_embeddings
 from beaty_common.torch_nets import CondTransformerGSVAE, GameplayEncoder, ReplayTensors, SentinelPredictor, TransformerGSVAE
 from beaty_common.train_utils import nanpad_collate_fn
 from vendor.xror.xror import XROR
@@ -53,7 +55,29 @@ DIFFICULTY_NAME_BY_CODE = {
 player_tar_cache = {}
 
 
-def load_models(bundle_path):
+@dataclass(slots=True)
+class TargetRequest:
+    song_hash: str
+    difficulty: str
+    player_id: str
+    request_index: int
+    zip_path: str
+
+
+@dataclass(slots=True)
+class GeneratedTrajectories:
+    trajectory: torch.Tensor
+    candidates: torch.Tensor
+
+
+@dataclass(slots=True)
+class OutputRecord:
+    target: TargetRequest
+    generated: GeneratedTrajectories
+    metrics: dict[str, float | int]
+
+
+def load_models(bundle_path: str) -> dict[str, Any]:
     bundle = torch.load(bundle_path, map_location="cpu", weights_only=False)
 
     style_predictor = CondTransformerGSVAE(**bundle["pred_kw"])
@@ -82,7 +106,7 @@ def load_models(bundle_path):
     }
 
 
-def load_request_rows(args):
+def load_request_rows(args: Namespace) -> tuple[pd.DataFrame, list[str], dict[str, int]]:
     boxrr23_manifest = pd.read_csv(args.boxrr23_manifest_path)
     boxrr23_manifest["User ID"] = boxrr23_manifest["User ID"].astype(str)
 
@@ -105,36 +129,36 @@ def load_request_rows(args):
     return request_rows, strong_player_ids, player_id_to_class_index
 
 
-def generate(models, target_player_id, target_song_hash, target_difficulty):
-    player_tar = player_tar_cache.get(target_player_id)
+def generate(models: dict[str, Any], target: TargetRequest) -> GeneratedTrajectories | None:
+    player_tar = player_tar_cache.get(target.player_id)
     if player_tar is None:
         response = requests.get(
-            f"https://huggingface.co/datasets/cschell/boxrr-23/resolve/main/users/{target_player_id[0]}/{target_player_id}.tar",
+            f"https://huggingface.co/datasets/cschell/boxrr-23/resolve/main/users/{target.player_id[0]}/{target.player_id}.tar",
             timeout=300,
         )
         if response.status_code != 200:
             raise RuntimeError(
-                f"Failed to fetch HF user tar for User ID {target_player_id}: {response.status_code} {response.text}"
+                f"Failed to fetch HF user tar for User ID {target.player_id}: {response.status_code} {response.text}"
             )
         with tarfile.open(fileobj=io.BytesIO(response.content), mode="r:") as tar_file:
             member_names = [member.name for member in tar_file.getmembers() if member.isfile()]
         if len(member_names) == 0:
-            raise ValueError(f"No replay files found in HF user tar for User ID {target_player_id}")
+            raise ValueError(f"No replay files found in HF user tar for User ID {target.player_id}")
         player_tar = {"bytes": response.content, "member_names": member_names}
-        player_tar_cache[target_player_id] = player_tar
+        player_tar_cache[target.player_id] = player_tar
 
     reference_replay = None
     with tarfile.open(fileobj=io.BytesIO(player_tar["bytes"]), mode="r:") as tar_file:
         for member_name in np.random.permutation(player_tar["member_names"]):
             member_file = tar_file.extractfile(str(member_name))
             if member_file is None:
-                raise ValueError(f"Failed to read replay {member_name} from HF user tar for User ID {target_player_id}")
+                raise ValueError(f"Failed to read replay {member_name} from HF user tar for User ID {target.player_id}")
 
             unpacked_xror = XROR.unpack(member_file.read())
             fetched_user_id = str(unpacked_xror.data["info"]["user"]["id"])
-            if fetched_user_id != target_player_id:
+            if fetched_user_id != target.player_id:
                 raise ValueError(
-                    f"HF user tar mismatch for User ID {target_player_id}: replay {member_name} belongs to {fetched_user_id}"
+                    f"HF user tar mismatch for User ID {target.player_id}: replay {member_name} belongs to {fetched_user_id}"
                 )
 
             try:
@@ -209,26 +233,30 @@ def generate(models, target_player_id, target_song_hash, target_difficulty):
         )
     )
     generated_3p, generated_candidates = generate_3p_from_style_embeddings(
-        playstyle_tokens,
-        playstyle_mask,
-        target_song_hash,
-        target_difficulty,
+        PlaystyleTensors(playstyle_tokens, playstyle_mask),
+        target.song_hash,
+        target.difficulty,
         models["style_predictor"],
         models["trajectory_decoder"],
         MODEL_DEVICE,
         models["chunk_length"],
         models["history_length"],
     )
-    return generated_3p.detach().cpu(), generated_candidates.detach().cpu()
+    return GeneratedTrajectories(generated_3p.detach().cpu(), generated_candidates.detach().cpu())
 
 
-def evaluate(models, generated_3p, target_zip_path, target_difficulty, player_category):
+def evaluate(
+    models: dict[str, Any],
+    generated: GeneratedTrajectories,
+    target: TargetRequest,
+    player_category: torch.Tensor,
+) -> dict[str, float | int] | None:
     try:
-        beatmap, map_info, song_duration = open_beatmap_from_bsmg_or_boxrr(target_zip_path, None, target_difficulty)
+        beatmap, map_info, song_duration = open_beatmap_from_bsmg_or_boxrr(target.zip_path, None, target.difficulty)
     except FileNotFoundError:
         return None
 
-    generated_3p = generated_3p.to(device=eval_device, dtype=torch.float32)
+    generated_3p = generated.trajectory.to(device=eval_device, dtype=torch.float32)
     notes_np, bombs_np, obstacles_np = get_cbo_np(beatmap, map_info)
     timestamps = np.arange(0, song_duration, 1 / 60)
     min_length = min(generated_3p.shape[2], timestamps.shape[0])
@@ -285,7 +313,7 @@ def evaluate(models, generated_3p, target_zip_path, target_difficulty, player_ca
         value.item()
         for value in evaluate_3p_on_map(
             generated_3p,
-            target_difficulty,
+            target.difficulty,
             STANDARD_CHARACTERISTIC,
             beatmap,
             map_info,
@@ -310,31 +338,25 @@ def evaluate(models, generated_3p, target_zip_path, target_difficulty, player_ca
 
 
 def write_record(
-    nc_out_path,
-    outputs_written,
-    generated_3p,
-    generated_candidates,
-    metrics,
-    target_song_hash,
-    target_difficulty,
-    target_player_id,
-    request_index,
-):
-    three_p_array = generated_3p.numpy()
-    candidate_array = generated_candidates.numpy()
+    nc_out_path: str,
+    outputs_written: int,
+    record: OutputRecord,
+) -> None:
+    three_p_array = record.generated.trajectory.numpy()
+    candidate_array = record.generated.candidates.numpy()
     three_p_dims = tuple(f"three_p_dim_{dim_index}" for dim_index in range(three_p_array.ndim))
     candidate_dims = tuple(f"cands_dim_{dim_index}" for dim_index in range(candidate_array.ndim))
     dataset = xr.Dataset(
         {
             "3p": (three_p_dims, three_p_array),
             "cands": (candidate_dims, candidate_array),
-            **metrics,
+            **record.metrics,
         },
         attrs={
-            "Song Hash": target_song_hash,
-            "Difficulty Level": target_difficulty,
-            "User ID": target_player_id,
-            "seed": int(request_index),
+            "Song Hash": record.target.song_hash,
+            "Difficulty Level": record.target.difficulty,
+            "User ID": record.target.player_id,
+            "seed": int(record.target.request_index),
         },
     )
     dataset.to_netcdf(
@@ -345,7 +367,7 @@ def write_record(
     )
 
 
-def main(args):
+def main(args: Namespace) -> None:
     os.makedirs("out", exist_ok=True)
     output_path = args.nc_out_path
     output_parent = os.path.dirname(os.path.abspath(output_path))
@@ -371,9 +393,6 @@ def main(args):
         torch.cuda.manual_seed_all(request_index)
 
         request_row = request_rows.iloc[request_index]
-        target_song_hash = str(request_row["Song Hash"])
-        target_difficulty = str(request_row["Difficulty Level"])
-        target_zip_path = f"{BEATSAVER_DIR}/{target_song_hash.upper()}.zip"
 
         if args.target_player_source == "csv":
             if "User ID" not in request_rows.columns:
@@ -390,36 +409,36 @@ def main(args):
             print(f"Skipping csv row {request_index}: target_player_id={target_player_id!r} not found in {args.boxrr23_manifest_path}")
             continue
 
-        generated = generate(models, target_player_id, target_song_hash, target_difficulty)
+        target = TargetRequest(
+            song_hash=str(request_row["Song Hash"]),
+            difficulty=str(request_row["Difficulty Level"]),
+            player_id=target_player_id,
+            request_index=request_index,
+            zip_path=f"{BEATSAVER_DIR}/{str(request_row['Song Hash']).upper()}.zip",
+        )
+        generated = generate(models, target)
         if generated is None:
             print(f"Skipping csv row {request_index}: found no valid reference replays for target_player_id={target_player_id!r}")
             continue
-        generated_3p, generated_candidates = generated
 
         player_category = torch.as_tensor([player_id_to_class_index[target_player_id]], device=eval_device)
-        metrics = evaluate(models, generated_3p, target_zip_path, target_difficulty, player_category)
+        metrics = evaluate(models, generated, target, player_category)
         if metrics is None:
             print(
-                f"Skipping csv row {request_index}: target map unavailable for target_song_hash={target_song_hash!r} "
-                f"target_difficulty={target_difficulty!r}"
+                f"Skipping csv row {request_index}: target map unavailable for target_song_hash={target.song_hash!r} "
+                f"target_difficulty={target.difficulty!r}"
             )
             continue
 
         print(
-            f"request_index={request_index} target_song_hash={target_song_hash!r} "
-            f"target_difficulty={target_difficulty!r} target_player_id={target_player_id!r}"
+            f"request_index={request_index} target_song_hash={target.song_hash!r} "
+            f"target_difficulty={target.difficulty!r} target_player_id={target.player_id!r}"
         )
         print(metrics)
         write_record(
             output_path,
             outputs_written,
-            generated_3p,
-            generated_candidates,
-            metrics,
-            target_song_hash,
-            target_difficulty,
-            target_player_id,
-            request_index,
+            OutputRecord(target, generated, metrics),
         )
         outputs_written += 1
         progress.update(1)

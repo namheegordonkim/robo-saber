@@ -1,6 +1,7 @@
 import json
 import os
 import zipfile
+from typing import Any
 
 import numpy as np
 import requests
@@ -17,7 +18,7 @@ from vendor.xror.xror import XROR
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
 
-def load_3p(xror, rescale_yes=False):
+def load_3p(xror: Any, rescale_yes: bool = False) -> tuple[np.ndarray, np.ndarray]:
     frames_np = np.array(xror.data["frames"])
     if frames_np.shape[0] < 2048:
         raise ValueError("XROR file has less than 2048 frames")
@@ -53,7 +54,13 @@ def load_3p(xror, rescale_yes=False):
     return trajectory_sixd.reshape(-1, 27), timestamps
 
 
-def load_cbo_and_3p(xror, beatmap, map_info, left_handed=False, rescale_yes=False):
+def load_cbo_and_3p(
+    xror: Any,
+    beatmap: dict[str, Any],
+    map_info: dict[str, Any],
+    left_handed: bool = False,
+    rescale_yes: bool = False,
+) -> dict[str, Any]:
     notes_np, bombs_np, obstacles_np = get_cbo_np(beatmap, map_info, left_handed)
     trajectory_sixd, timestamps = load_3p(xror, rescale_yes=rescale_yes)
     song_duration = timestamps.max()
@@ -70,7 +77,7 @@ def load_cbo_and_3p(xror, beatmap, map_info, left_handed=False, rescale_yes=Fals
     }
 
 
-def open_bsmg(filename, difficulty):
+def open_bsmg(filename: str, difficulty: str) -> tuple[dict[str, np.ndarray], dict[str, Any], dict[str, Any]]:
     beatmap, map_info, song_duration = open_beatmap_from_bsmg_or_boxrr(filename, None, difficulty)
     notes_np, bombs_np, obstacles_np = get_cbo_np(beatmap, map_info)
     timestamps = np.arange(0, song_duration, 1 / 60)
@@ -82,7 +89,11 @@ def open_bsmg(filename, difficulty):
     }, beatmap, map_info
 
 
-def open_beatmap_from_bsmg_or_boxrr(zip_path: str, xror_path: str, difficulty: str):
+def open_beatmap_from_bsmg_or_boxrr(
+    zip_path: str,
+    xror_path: str | None,
+    difficulty: str,
+) -> tuple[dict[str, Any], dict[str, Any], float]:
     if xror_path is not None:
         with open(xror_path, "rb") as f:
             file = f.read()
@@ -143,13 +154,13 @@ def open_beatmap_from_bsmg_or_boxrr(zip_path: str, xror_path: str, difficulty: s
     return beatmap, map_info, song_duration
 
 
-def open_beatmap_from_raw_xror(xror_raw):
+def open_beatmap_from_raw_xror(xror_raw: bytes) -> tuple[dict[str, Any], dict[str, Any]]:
     xror = XROR.unpack(xror_raw)
     beatmap, map_info = open_beatmap_from_unpacked_xror(xror)
     return beatmap, map_info
 
 
-def open_beatmap_from_unpacked_xror(xror):
+def open_beatmap_from_unpacked_xror(xror: Any) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
         difficulty = xror.data["info"]["software"]["activity"]["difficulty"]
     except KeyError:
@@ -168,7 +179,7 @@ def open_beatmap_from_unpacked_xror(xror):
     return open_beatmap_from_bsmg_or_boxrr(zip_path, None, difficulty)[:2]
 
 
-def get_beatsaver_data(song_hashes):
+def get_beatsaver_data(song_hashes: list[str]) -> dict[str, Any]:
     song_hashes = [str(song_hash) for song_hash in song_hashes]
     if len(song_hashes) == 1:
         url = f"https://api.beatsaver.com/maps/hash/{song_hashes[0]}"
@@ -186,7 +197,11 @@ def get_beatsaver_data(song_hashes):
     return beatsaver_data
 
 
-def get_cbo_np(beatmap, map_info, left_handed=False):
+def get_cbo_np(
+    beatmap: dict[str, Any],
+    map_info: dict[str, Any],
+    left_handed: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     base_bpm = map_info["_beatsPerMinute"]
     bpm_changes = [(0, base_bpm)]
     if "bpmEvents" in beatmap.keys():
@@ -334,7 +349,7 @@ def get_cbo_np(beatmap, map_info, left_handed=False):
     return notes_np, bombs_np, obstacles_np
 
 
-def extract_3p_with_60fps(frames_np):
+def extract_3p_with_60fps(frames_np: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     my_pos_quat, my_pos_sixd, timestamps = get_pos_sixd(frames_np)
     last_zero_idx = np.where(timestamps < 1e-7)[0][-1]
     timestamps = timestamps[last_zero_idx:]
@@ -379,7 +394,7 @@ def extract_3p_with_60fps(frames_np):
     return interp_pos_quat, interpolated, sixty_fps_timestamps
 
 
-def get_pos_sixd(frames_np):
+def get_pos_sixd(frames_np: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     timestamps = frames_np[1:, ..., 0]
     part_data = frames_np[1:, ..., 1:]
     part_data = part_data.reshape(part_data.shape[0], 3, -1)
@@ -393,7 +408,7 @@ def get_pos_sixd(frames_np):
     return my_pos_quat, my_pos_sixd, timestamps
 
 
-def slerp_quaternions(q0: np.ndarray, q1: np.ndarray, t: np.ndarray, eps: float = 1e-6):
+def slerp_quaternions(q0: np.ndarray, q1: np.ndarray, t: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     """
     Vectorized SLERP for quaternions with order (x, y, z, w).
     Handles shortest-path interpolation by flipping q1 when dot(q0, q1) < 0.

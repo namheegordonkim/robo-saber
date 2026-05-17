@@ -1,11 +1,12 @@
 import numpy as np
 import torch
+from typing import Any
 
 from beaty_common.bsmg_xror_utils import device, get_cbo_np
 from beaty_common.data_utils import sample_for_evaluation
 from beaty_common.train_utils import nanpad_collate_fn
 from beaty_common.torch_nets import MapTensors, ReplayTensors
-from vendor.torch_saber import TorchSaber
+from vendor.torch_saber import PlayerMotion, SaberSimulation, TorchSaber
 
 EVALUATION_SEGMENT_LENGTH = 72
 EVALUATION_SAMPLE_COUNT = 1
@@ -15,10 +16,17 @@ EVALUATION_LOOKAHEAD_SECONDS = 4.0
 EVALUATION_PURVIEW_NOTES = 80
 EVALUATION_FLOOR_TIME = -0.5
 SIMULATION_BATCH_SIZE = 1024
-PLAYER_HEIGHT = 1.5044
 
 
-def evaluate_3p_on_map(trajectory_3p, difficulty, characteristic, beatmap, map_info, song_duration, left_handed=False):
+def evaluate_3p_on_map(
+    trajectory_3p: torch.Tensor,
+    difficulty: str,
+    characteristic: str,
+    beatmap: dict[str, Any],
+    map_info: dict[str, Any],
+    song_duration: float,
+    left_handed: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     notes_np, bombs_np, obstacles_np = get_cbo_np(beatmap, map_info)
     timestamps = np.arange(0, song_duration, 1 / 60)
     min_length = min(trajectory_3p.shape[2], timestamps.shape[0])
@@ -60,52 +68,30 @@ def evaluate_3p_on_map(trajectory_3p, difficulty, characteristic, beatmap, map_i
         obstacle_ids=sampled_map.obstacle_ids[:, None],
     )
 
-    (
-        note_appeared_mask,
-        bomb_appeared_mask,
-        bomb_collided_mask,
-        head_obstacle_signed_distances,
-        good_cut_mask,
-        bad_cut_mask,
-        cut_angles,
-    ) = TorchSaber.simulate(
-        trajectory_3p[:, :, [0]],
-        trajectory_3p,
-        simulation_replay,
-        MapTensors(collated["notes_np"], collated["bombs_np"], collated["obstacles_np"]),
-        PLAYER_HEIGHT,
-        note_jump_speed,
-        SIMULATION_BATCH_SIZE,
+    masks = TorchSaber.simulate(
+        SaberSimulation(
+            PlayerMotion(trajectory_3p[:, :, [0]], trajectory_3p),
+            simulation_replay,
+            MapTensors(collated["notes_np"], collated["bombs_np"], collated["obstacles_np"]),
+            note_jump_speed,
+        ),
+        batch_size=SIMULATION_BATCH_SIZE,
     )
     note_alive_mask = torch.where(
         torch.isnan(collated["notes_np"][..., 0]),
         torch.as_tensor(False),
         torch.as_tensor(True),
     )[..., None, :]
-    (
-        normalized_score,
-        n_opportunities,
-        n_hits,
-        n_misses,
-        n_goods,
-        collided_note_mask,
-        bomb_penalty,
-        obstacle_penalty,
-    ) = TorchSaber.evaluate(
+    evaluation = TorchSaber.evaluate(
         note_alive_mask.to(device),
-        note_appeared_mask.to(device),
-        bomb_appeared_mask.to(device),
-        bomb_collided_mask.to(device),
-        head_obstacle_signed_distances.to(device),
-        good_cut_mask.to(device),
-        bad_cut_mask.to(device),
-        cut_angles.to(device),
+        masks,
         batch_size=SIMULATION_BATCH_SIZE,
     )
-    return normalized_score, n_opportunities, n_goods, n_hits, n_misses
+    score = evaluation.score
+    return score.normalized_score, score.n_opportunities, score.n_goods, score.n_hits, score.n_misses
 
 
-def get_njs(map_info, difficulty, characteristic):
+def get_njs(map_info: dict[str, Any], difficulty: str, characteristic: str) -> float:
     found = False
     njs = 18
     for difficulty_beatmap_set in map_info["_difficultyBeatmapSets"]:

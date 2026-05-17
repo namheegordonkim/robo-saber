@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 import numpy as np
 import pyvista as pv
 import torch
@@ -22,62 +24,103 @@ plane_top = plane_height
 note_x_offset = 0.9
 note_y_offset = 0.0
 note_z_offset = 0.0
+PLAYER_HEIGHT = 1.5044
 
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+
+@dataclass(slots=True)
+class PlayerMotion:
+    carry_3p: torch.Tensor
+    trajectory_3p: torch.Tensor
+
+
+@dataclass(slots=True)
+class SaberSimulation:
+    motion: PlayerMotion
+    replay: ReplayTensors
+    map_profiles: MapTensors
+    note_jump_speed: float
+
+
+@dataclass(slots=True)
+class MapObjectIds:
+    notes: torch.Tensor
+    bombs: torch.Tensor
+
+
+@dataclass(slots=True)
+class NoteCollisionMasks:
+    appeared: torch.Tensor
+    good_cut: torch.Tensor
+    bad_cut: torch.Tensor
+    cut_angles: torch.Tensor
+
+
+@dataclass(slots=True)
+class SimulationMasks:
+    notes: NoteCollisionMasks
+    bomb_appeared: torch.Tensor
+    bomb_collided: torch.Tensor
+    head_obstacle_distances: torch.Tensor
+
+
+@dataclass(slots=True)
+class SaberScore:
+    normalized_score: torch.Tensor
+    n_opportunities: torch.Tensor
+    n_hits: torch.Tensor
+    n_misses: torch.Tensor
+    n_goods: torch.Tensor
+
+
+@dataclass(slots=True)
+class CandidateFeedback:
+    normalized_score: torch.Tensor
+    hit_note_mask: torch.Tensor
+    bomb_penalty: torch.Tensor
+    obstacle_penalty: torch.Tensor
+
+
+@dataclass(slots=True)
+class SaberEvaluation:
+    score: SaberScore
+    feedback: CandidateFeedback
+
+
+@dataclass(slots=True)
+class BoxGeometry:
+    vertices: torch.Tensor
+    quats: torch.Tensor
 
 
 class TorchSaber:
     @staticmethod
     def evaluate_and_simulate(
-        carry_3p: torch.Tensor,
-        my_3p_traj: torch.Tensor,
-        replay: ReplayTensors,
-        map_profiles: MapTensors,
+        simulation: SaberSimulation,
         note_alive_mask: torch.Tensor,
-        player_height: float,
-        njs: float,
-        batch_size: int = None,
-    ):
-        (
-            note_appeared_mask,
-            bomb_appeared_mask,
-            bomb_collided_mask,
-            head_obstacle_signed_distances,
-            good_cut_mask,
-            bad_cut_mask,
-            cut_angles,
-        ) = TorchSaber.simulate(
-            carry_3p,
-            my_3p_traj,
-            replay,
-            map_profiles,
-            player_height,
-            njs,
-            batch_size,
-        )
-        return TorchSaber.evaluate(
+    ) -> CandidateFeedback:
+        masks = TorchSaber.simulate(simulation)
+        evaluation = TorchSaber.evaluate(
             note_alive_mask.to(device),
-            note_appeared_mask.to(device),
-            bomb_appeared_mask.to(device),
-            bomb_collided_mask.to(device),
-            head_obstacle_signed_distances.to(device),
-            good_cut_mask.to(device),
-            bad_cut_mask.to(device),
-            cut_angles.to(device),
+            masks,
         )
+        return evaluation.feedback
 
     @staticmethod
     def evaluate(
-        note_alive_mask,
-        note_appeared_mask,
-        bomb_appeared_mask,
-        bomb_collided_mask,
-        head_obstacle_signed_distances,
-        good_cut_mask,
-        bad_cut_mask,
-        cut_angles,
-        batch_size: int = None,
-    ):
+        note_alive_mask: torch.Tensor,
+        masks: SimulationMasks,
+        batch_size: int | None = None,
+    ) -> SaberEvaluation:
+        note_appeared_mask = masks.notes.appeared.to(device)
+        bomb_appeared_mask = masks.bomb_appeared.to(device)
+        bomb_collided_mask = masks.bomb_collided.to(device)
+        head_obstacle_signed_distances = masks.head_obstacle_distances.to(device)
+        good_cut_mask = masks.notes.good_cut.to(device)
+        bad_cut_mask = masks.notes.bad_cut.to(device)
+        cut_angles = masks.notes.cut_angles.to(device)
+
         max_int8 = torch.iinfo(torch.int8).max
         min_int8 = torch.iinfo(torch.int8).min
         note_batches = torch.split(
@@ -89,7 +132,7 @@ class TorchSaber:
         n_hits = torch.zeros_like(n_opportunities)
         n_goods = torch.zeros_like(n_opportunities)
         total_score = torch.zeros_like(n_opportunities, dtype=torch.float32)
-        collided_note_batches = []
+        hit_note_batches = []
         pre_window_size = 24
         post_window_size = 24
         score_shape = list(cut_angles.shape[:3]) + [1]
@@ -139,9 +182,9 @@ class TorchSaber:
             swing_score = torch.where(first_good_frame, swing_score, torch.nan)
             total_score += swing_score.nansum(-1).nansum(-1).nan_to_num(0)
 
-            collided_note_mask = hit_mask.any(-2).any(2)
-            collided_note_batches.append(collided_note_mask)
-            n_hits += collided_note_mask.sum(-1)
+            hit_note_mask = hit_mask.any(-2).any(2)
+            hit_note_batches.append(hit_note_mask)
+            n_hits += hit_note_mask.sum(-1)
             n_goods += final_good_mask.sum(-1)
 
         denominator = torch.where(n_opportunities == 0, torch.ones_like(n_opportunities), n_opportunities)
@@ -151,33 +194,35 @@ class TorchSaber:
         obstacle_penalty = head_obstacle_signed_distances.nanmean(-1).nanmean(-1).nan_to_num(10)
         obstacle_penalty[obstacle_penalty < 0] = -torch.inf
 
-        return (
-            normalized_score,
-            n_opportunities,
-            n_hits,
-            n_misses,
-            n_goods,
-            torch.cat(collided_note_batches, dim=-1),
-            bomb_penalty,
-            obstacle_penalty,
+        return SaberEvaluation(
+            score=SaberScore(
+                normalized_score=normalized_score,
+                n_opportunities=n_opportunities,
+                n_hits=n_hits,
+                n_misses=n_misses,
+                n_goods=n_goods,
+            ),
+            feedback=CandidateFeedback(
+                normalized_score=normalized_score,
+                hit_note_mask=torch.cat(hit_note_batches, dim=-1),
+                bomb_penalty=bomb_penalty,
+                obstacle_penalty=obstacle_penalty,
+            ),
         )
 
     @staticmethod
     def simulate(
-        carry_3p: torch.Tensor,
-        my_3p_traj: torch.Tensor,
-        replay: ReplayTensors,
-        map_profiles: MapTensors,
-        player_height: float,
-        njs: float,
-        batch_size: int = None,
-    ):
+        simulation: SaberSimulation,
+        batch_size: int | None = None,
+    ) -> SimulationMasks:
+        replay = simulation.replay
+        trajectory_3p = simulation.motion.trajectory_3p
+        carry_3p = simulation.motion.carry_3p
         assert replay.note_ids is not None
         assert replay.bomb_ids is not None
-        assert replay.obstacle_ids is not None
         frame_batches = torch.split(
-            torch.arange(my_3p_traj.shape[2], device=device),
-            batch_size if batch_size is not None else my_3p_traj.shape[2],
+            torch.arange(trajectory_3p.shape[2], device=device),
+            batch_size if batch_size is not None else trajectory_3p.shape[2],
         )
 
         note_appeared_batches = []
@@ -188,9 +233,10 @@ class TorchSaber:
         bad_cut_batches = []
         cut_angle_batches = []
 
-        unique_note_ids = torch.arange(map_profiles.notes.shape[1], device=device)
-        unique_bomb_ids = torch.arange(map_profiles.bombs.shape[1], device=device)
-        unique_obstacle_ids = torch.arange(map_profiles.obstacles.shape[1], device=device)
+        map_object_ids = MapObjectIds(
+            notes=torch.arange(simulation.map_profiles.notes.shape[1], device=device),
+            bombs=torch.arange(simulation.map_profiles.bombs.shape[1], device=device),
+        )
 
         for frame_batch in frame_batches:
             replay_window = ReplayTensors(
@@ -199,47 +245,40 @@ class TorchSaber:
                 replay.obstacles[:, :, frame_batch],
                 note_ids=replay.note_ids[:, :, frame_batch],
                 bomb_ids=replay.bomb_ids[:, :, frame_batch],
-                obstacle_ids=replay.obstacle_ids[:, :, frame_batch],
             )
-            (
-                note_appeared_mask,
-                bomb_appeared_mask,
-                bomb_collided_mask,
-                head_obstacle_signed_distances,
-                good_cut_mask,
-                bad_cut_mask,
-                cut_angles,
-            ) = TorchSaber.get_collision_masks(
-                carry_3p,
-                my_3p_traj[:, :, frame_batch],
+            masks = TorchSaber.get_collision_masks(
+                PlayerMotion(carry_3p, trajectory_3p[:, :, frame_batch]),
                 replay_window,
-                player_height,
-                unique_note_ids,
-                unique_bomb_ids,
-                unique_obstacle_ids,
-                njs,
+                simulation.note_jump_speed,
+                map_object_ids,
             )
-            note_appeared_batches.append(note_appeared_mask)
-            bomb_appeared_batches.append(bomb_appeared_mask)
-            bomb_collided_batches.append(bomb_collided_mask)
-            obstacle_distance_batches.append(head_obstacle_signed_distances)
-            good_cut_batches.append(good_cut_mask)
-            bad_cut_batches.append(bad_cut_mask)
-            cut_angle_batches.append(cut_angles)
-            carry_3p = my_3p_traj[:, :, frame_batch[[-1]]]
+            note_appeared_batches.append(masks.notes.appeared)
+            bomb_appeared_batches.append(masks.bomb_appeared)
+            bomb_collided_batches.append(masks.bomb_collided)
+            obstacle_distance_batches.append(masks.head_obstacle_distances)
+            good_cut_batches.append(masks.notes.good_cut)
+            bad_cut_batches.append(masks.notes.bad_cut)
+            cut_angle_batches.append(masks.notes.cut_angles)
+            carry_3p = trajectory_3p[:, :, frame_batch[[-1]]]
 
-        return (
-            torch.cat(note_appeared_batches, dim=2),
-            torch.cat(bomb_appeared_batches, dim=2),
-            torch.cat(bomb_collided_batches, dim=2),
-            torch.cat(obstacle_distance_batches, dim=2),
-            torch.cat(good_cut_batches, dim=2),
-            torch.cat(bad_cut_batches, dim=2),
-            torch.cat(cut_angle_batches, dim=2),
+        return SimulationMasks(
+            notes=NoteCollisionMasks(
+                appeared=torch.cat(note_appeared_batches, dim=2),
+                good_cut=torch.cat(good_cut_batches, dim=2),
+                bad_cut=torch.cat(bad_cut_batches, dim=2),
+                cut_angles=torch.cat(cut_angle_batches, dim=2),
+            ),
+            bomb_appeared=torch.cat(bomb_appeared_batches, dim=2),
+            bomb_collided=torch.cat(bomb_collided_batches, dim=2),
+            head_obstacle_distances=torch.cat(obstacle_distance_batches, dim=2),
         )
 
     @staticmethod
-    def get_note_verts_and_normals_and_quats(note_bags: torch.Tensor, player_height: float, njs: float, collider_type: int):
+    def get_note_geometry(
+        note_bags: torch.Tensor,
+        note_jump_speed: float,
+        collider_type: int,
+    ) -> BoxGeometry:
         n_songs, n_cands, n_frames, n_notes = note_bags.shape[:4]
         if collider_type == 0:
             note_collider_mesh = pv.Cube(x_length=1.0, y_length=0.8, z_length=0.5)
@@ -263,10 +302,6 @@ class TorchSaber:
         note_quats = torch.tensor(note_quats.reshape(n_songs, n_cands, n_frames, n_notes, 4), dtype=torch.float, device=device)
         note_vertices = quat_rotate(note_quats[..., None, :].repeat_interleave(8, -2), note_vertices)
 
-        note_normals = torch.tensor(note_collider_mesh.face_normals, dtype=torch.float, device=device)
-        note_normals = note_normals[None, None, None, None].repeat(n_songs, n_cands, n_frames, n_notes, 1, 1)
-        note_normals = quat_rotate(note_quats[..., None, :].repeat_interleave(6, -2), note_normals)
-
         plane_grid = np.array(
             np.meshgrid(
                 np.linspace(plane_right, plane_left, 4),
@@ -276,19 +311,22 @@ class TorchSaber:
         plane_grid = torch.tensor(plane_grid, dtype=torch.float, device=device)
 
         note_positions = plane_grid[note_values[..., 3], note_values[..., 4]]
-        note_positions = torch.concatenate([note_bags[..., [0]] * njs + note_x_offset, note_positions], dim=-1)
+        note_positions = torch.concatenate([note_bags[..., [0]] * note_jump_speed + note_x_offset, note_positions], dim=-1)
         note_positions[..., 1] += note_y_offset
-        note_positions[..., 2] += player_height / 2
+        note_positions[..., 2] += PLAYER_HEIGHT / 2
         note_positions[..., 2] += note_z_offset
 
         note_vertices += note_positions[..., None, :]
         if collider_type == 0 or collider_type == 1:
             note_vertices[..., 0] -= 0.25
 
-        return note_vertices, note_normals, note_quats
+        return BoxGeometry(note_vertices, note_quats)
 
     @staticmethod
-    def get_obstacle_verts_and_normals(obstacle_bags: torch.Tensor, player_height: float, njs: float):
+    def get_obstacle_verts_and_normals(
+        obstacle_bags: torch.Tensor,
+        note_jump_speed: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         n_songs, n_cands, n_frames, n_obstacles = obstacle_bags.shape[:4]
         obstacle_values = obstacle_bags.detach().cpu().numpy() * 1
         obstacle_values = np.where(np.isnan(obstacle_values), 0, obstacle_values).astype(int)
@@ -308,14 +346,14 @@ class TorchSaber:
             obstacle_values[..., [5, 6]],
             device=device,
         )
-        obstacle_positions = torch.concatenate([obstacle_bags[..., [0]] * njs + note_x_offset, obstacle_positions], dim=-1)
-        obstacle_positions[..., 2] += player_height / 2
+        obstacle_positions = torch.concatenate([obstacle_bags[..., [0]] * note_jump_speed + note_x_offset, obstacle_positions], dim=-1)
+        obstacle_positions[..., 2] += PLAYER_HEIGHT / 2
         obstacle_positions[..., 2] += note_z_offset
         obstacle_positions[..., 1] += note_y_offset
         obstacle_vertices[..., [1, 2]] += obstacle_positions[..., None, [1, 2]]
 
-        obstacle_vertices[..., 0] = obstacle_bags[..., [0]] * njs + note_x_offset
-        obstacle_vertices[..., -4:, 0] += obstacle_bags[..., [4]] * njs + note_x_offset
+        obstacle_vertices[..., 0] = obstacle_bags[..., [0]] * note_jump_speed + note_x_offset
+        obstacle_vertices[..., -4:, 0] += obstacle_bags[..., [4]] * note_jump_speed + note_x_offset
         obstacle_vertices[..., [1, 2, 6, 7], 2] += (obstacle_bags[..., [-1]] - 1) * plane_height_interval
         obstacle_vertices[..., [0, 1, 4, 7], 1] = (
             obstacle_vertices[..., [2, 3, 5, 6], 1] - obstacle_bags[..., [-2]] * plane_width_interval
@@ -329,11 +367,12 @@ class TorchSaber:
 
     @staticmethod
     def box_trail_collision_from_verts(
-        box_verts: torch.Tensor,
-        box_quats: torch.Tensor,
+        box_geometry: BoxGeometry,
         saber_xyzs: torch.Tensor,
         saber_quats: torch.Tensor,
-    ):
+    ) -> torch.Tensor:
+        box_verts = box_geometry.vertices
+        box_quats = box_geometry.quats
         n_songs, n_cands, n_frames = box_verts.shape[:3]
         note_positions = box_verts.mean(-2)
 
@@ -386,33 +425,27 @@ class TorchSaber:
 
     @staticmethod
     def get_collision_masks(
-        carry_3p: torch.Tensor,
-        my_3p_traj: torch.Tensor,
+        motion: PlayerMotion,
         replay: ReplayTensors,
-        player_height: float,
-        unique_note_ids: torch.Tensor,
-        unique_bomb_ids: torch.Tensor,
-        unique_obstacle_ids: torch.Tensor,
-        njs: float,
-    ):
+        note_jump_speed: float,
+        map_object_ids: MapObjectIds,
+    ) -> SimulationMasks:
         assert replay.note_ids is not None
         assert replay.bomb_ids is not None
-        assert replay.obstacle_ids is not None
         note_bags = replay.notes
         bomb_bags = replay.bombs
         obstacle_bags = replay.obstacles
         note_ids = replay.note_ids
         bomb_ids = replay.bomb_ids
-        obstacle_ids = replay.obstacle_ids
 
-        n_songs, n_cands, n_frames = my_3p_traj.shape[:3]
+        n_songs, n_cands, n_frames = motion.trajectory_3p.shape[:3]
         n_notes = note_bags.shape[-2]
-        full_trajectory = torch.cat([carry_3p, my_3p_traj], dim=2)
+        full_trajectory = torch.cat([motion.carry_3p, motion.trajectory_3p], dim=2)
 
-        note_gc_verts, _, note_gc_quats = TorchSaber.get_note_verts_and_normals_and_quats(note_bags, player_height, njs, 0)
-        note_bc_verts, _, note_bc_quats = TorchSaber.get_note_verts_and_normals_and_quats(note_bags, player_height, njs, 2)
-        bomb_verts, _, bomb_quats = TorchSaber.get_note_verts_and_normals_and_quats(bomb_bags, player_height, njs, 2)
-        obstacle_verts, obstacle_normals = TorchSaber.get_obstacle_verts_and_normals(obstacle_bags, player_height, njs)
+        good_cut_geometry = TorchSaber.get_note_geometry(note_bags, note_jump_speed, 0)
+        bad_cut_geometry = TorchSaber.get_note_geometry(note_bags, note_jump_speed, 2)
+        bomb_geometry = TorchSaber.get_note_geometry(bomb_bags, note_jump_speed, 2)
+        obstacle_verts, obstacle_normals = TorchSaber.get_obstacle_verts_and_normals(obstacle_bags, note_jump_speed)
 
         note_values = note_bags.detach().cpu().numpy() * 1
         note_values = np.where(np.isnan(note_values), 0, note_values).astype(int)
@@ -424,9 +457,21 @@ class TorchSaber:
         saber_xyz = trajectory_xyz[..., [1, 2], :]
         saber_quat = trajectory_quat[..., [1, 2], :]
 
-        good_cut_collision = TorchSaber.box_trail_collision_from_verts(note_gc_verts, note_gc_quats, saber_xyz, saber_quat)
-        bad_cut_collision = TorchSaber.box_trail_collision_from_verts(note_bc_verts, note_bc_quats, saber_xyz, saber_quat)
-        bomb_collision = TorchSaber.box_trail_collision_from_verts(bomb_verts, bomb_quats, saber_xyz, saber_quat)
+        good_cut_collision = TorchSaber.box_trail_collision_from_verts(
+            good_cut_geometry,
+            saber_xyz,
+            saber_quat,
+        )
+        bad_cut_collision = TorchSaber.box_trail_collision_from_verts(
+            bad_cut_geometry,
+            saber_xyz,
+            saber_quat,
+        )
+        bomb_collision = TorchSaber.box_trail_collision_from_verts(
+            bomb_geometry,
+            saber_xyz,
+            saber_quat,
+        )
 
         note_colors = note_values[..., -3]
         color_onehots = torch.eye(2, dtype=torch.bool, device=device)[note_colors].swapaxes(-2, -1)
@@ -453,7 +498,7 @@ class TorchSaber:
             n_notes,
             1,
         )
-        cut_direction_vectors = quat_rotate(note_gc_quats, cut_direction_vectors)
+        cut_direction_vectors = quat_rotate(good_cut_geometry.quats, cut_direction_vectors)
         one_zero_zero = torch.zeros_like(cut_direction_vectors, device=device)
         one_zero_zero[..., 0] = 1
         zero_one_zero = torch.zeros_like(cut_direction_vectors, device=device)
@@ -478,13 +523,13 @@ class TorchSaber:
         bad_cut_across_time = bad_cut_collision & (wrong_color_collision | bad_direction)
         good_cut_across_time = good_cut_collision & matching_color_collision & good_direction
 
-        note_appeared_global_to_local = unique_note_ids[None, None, None, :, None] == note_ids[..., None, :]
+        note_appeared_global_to_local = map_object_ids.notes[None, None, None, :, None] == note_ids[..., None, :]
         note_appeared_local_to_global = note_appeared_global_to_local.swapaxes(-2, -1)
         note_appeared_mask = note_appeared_global_to_local.any(-1).detach().cpu()
 
-        bomb_appeared_mask = (unique_bomb_ids[None, None, None, :, None] == bomb_ids[..., None, :]).any(-1).detach().cpu()
+        bomb_appeared_mask = (map_object_ids.bombs[None, None, None, :, None] == bomb_ids[..., None, :]).any(-1).detach().cpu()
         bomb_collided_ids = torch.where(bomb_collision.any(-2), bomb_ids, torch.nan)
-        bomb_collided_mask = (unique_bomb_ids[None, None, None, :, None] == bomb_collided_ids[..., None, :]).any(-1).detach().cpu()
+        bomb_collided_mask = (map_object_ids.bombs[None, None, None, :, None] == bomb_collided_ids[..., None, :]).any(-1).detach().cpu()
 
         head_xyz = trajectory_xyz[:, :, 1:, [0]]
         obstacle_mins = obstacle_verts.min(-2)[0]
@@ -497,19 +542,21 @@ class TorchSaber:
         head_obstacle_signed_distances = head_obstacle_distances * torch.where(head_inside_obstacle, 0, 1)
 
         good_cut_note_ids = torch.where(good_cut_across_time, note_ids.unsqueeze(-2), torch.nan)
-        good_cut_mask = (unique_note_ids[None, None, None, :, None] == good_cut_note_ids[..., None, :]).any(-1).detach().cpu()
+        good_cut_mask = (map_object_ids.notes[None, None, None, :, None] == good_cut_note_ids[..., None, :]).any(-1).detach().cpu()
         bad_cut_note_ids = torch.where(bad_cut_across_time, note_ids.unsqueeze(-2), torch.nan)
-        bad_cut_mask = (unique_note_ids[None, None, None, :, None] == bad_cut_note_ids[..., None, :]).any(-1).detach().cpu()
+        bad_cut_mask = (map_object_ids.notes[None, None, None, :, None] == bad_cut_note_ids[..., None, :]).any(-1).detach().cpu()
 
         note_cut_angles = torch.full(note_appeared_mask.shape, torch.nan, dtype=torch.float16, device=device)
         note_cut_angles[torch.where(note_appeared_global_to_local)[:-1]] = cut_angles[torch.where(note_appeared_local_to_global)[:-1]]
 
-        return (
-            note_appeared_mask,
-            bomb_appeared_mask,
-            bomb_collided_mask,
-            head_obstacle_signed_distances,
-            good_cut_mask,
-            bad_cut_mask,
-            note_cut_angles.detach().cpu(),
+        return SimulationMasks(
+            notes=NoteCollisionMasks(
+                appeared=note_appeared_mask,
+                good_cut=good_cut_mask,
+                bad_cut=bad_cut_mask,
+                cut_angles=note_cut_angles.detach().cpu(),
+            ),
+            bomb_appeared=bomb_appeared_mask,
+            bomb_collided=bomb_collided_mask,
+            head_obstacle_distances=head_obstacle_signed_distances,
         )

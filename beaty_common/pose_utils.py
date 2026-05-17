@@ -26,7 +26,7 @@ def quat_to_sixd(quat: np.ndarray or torch.Tensor) -> np.ndarray or torch.Tensor
     return sixd
 
 
-def slerp(q0, q1, t):
+def slerp(q0: torch.Tensor, q1: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     cos_half_theta = torch.sum(q0 * q1, dim=-1)
 
     neg_mask = cos_half_theta < 0
@@ -49,7 +49,7 @@ def slerp(q0, q1, t):
     return new_q
 
 
-def interpolate_xyzsixd(keypoints, stride):
+def interpolate_xyzsixd(keypoints: torch.Tensor, stride: int) -> torch.Tensor:
     device = keypoints.device
     if keypoints.shape[2] == 1:
         return keypoints[:, :, :, None].repeat_interleave(stride, -3)

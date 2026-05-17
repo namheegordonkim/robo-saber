@@ -14,7 +14,7 @@ def process_object_bag(
     floor_time: float,
     use_max_object_count: bool = False,
     is_obstacle: bool = False,
-):
+) -> tuple[torch.Tensor, torch.Tensor]:
     max_object_count = max(object_bags.shape[1], purview_count) if use_max_object_count else object_bags.shape[1]
     objects_for_segments = object_bags[segment_indices[..., 0]]
 
@@ -211,7 +211,13 @@ def sample_for_evaluation(
     )
 
 
-def get_segment_indices(lengths, n_samples, segment_length, stride, firsts_only):
+def get_segment_indices(
+    lengths: torch.Tensor,
+    n_samples: int,
+    segment_length: int,
+    stride: int,
+    firsts_only: bool,
+) -> torch.Tensor:
     local_device = lengths.device
     song_indices = (torch.rand(n_samples) * lengths.shape[0]).to(dtype=torch.long, device=local_device)
     start_frames = (torch.rand(n_samples, device=local_device) * (lengths[song_indices] - segment_length)).to(

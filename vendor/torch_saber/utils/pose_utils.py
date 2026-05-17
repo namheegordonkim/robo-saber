@@ -2,7 +2,7 @@ import numpy as np
 import torch
 
 
-def quat_rotate(q, v):
+def quat_rotate(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """
     Rotate vector(s) v about the rotation described by quaternion(s) q.
     Expects a tensor of shape (*, 4) for q and a tensor of shape (*, 3) for v,
@@ -23,7 +23,7 @@ def quat_rotate(q, v):
     return (v + 2 * (q[..., -1:] * uv + uuv)).view(original_shape)
 
 
-def unity_to_zup(xyz: np.ndarray, quat: np.ndarray):
+def unity_to_zup(xyz: np.ndarray | torch.Tensor, quat: np.ndarray | torch.Tensor) -> tuple[np.ndarray | torch.Tensor, np.ndarray | torch.Tensor]:
     my_pos = xyz
     my_pos[..., [0, 1, 2]] = my_pos[..., [2, 0, 1]]
     my_pos[..., 1] *= -1

@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
@@ -12,7 +13,7 @@ class GameTensors:
     obstacles: torch.Tensor
     history: torch.Tensor
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         for name, value in (
             ("notes", self.notes),
             ("bombs", self.bombs),
@@ -35,7 +36,7 @@ class ReplayTensors:
     bomb_ids: torch.Tensor | None = None
     obstacle_ids: torch.Tensor | None = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         for name, value in (
             ("notes", self.notes),
             ("bombs", self.bombs),
@@ -67,7 +68,7 @@ class MapTensors:
     bombs: torch.Tensor
     obstacles: torch.Tensor
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         for name, value in (
             ("notes", self.notes),
             ("bombs", self.bombs),
@@ -93,7 +94,7 @@ def gumbel_softmax(
 
 
 class RunningMeanStd(nn.Module):
-    def __init__(self, epsilon: float = 1e-4, shape=(), *args, **kwargs):
+    def __init__(self, epsilon: float = 1e-4, shape: int | tuple[int, ...] = (), *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.mean = nn.Parameter(torch.zeros(shape, dtype=torch.float), requires_grad=False)
         self.var = nn.Parameter(torch.ones(shape, dtype=torch.float), requires_grad=False)
@@ -148,7 +149,7 @@ class CondTransformerGSVAE(nn.Module, InvarMixin):
         vocab_size: int,
         num_heads: int,
         num_layers: int,
-    ):
+    ) -> None:
         super().__init__()
         self.note_size = note_size
         self.bomb_size = bomb_size
@@ -216,7 +217,7 @@ class CondTransformerGSVAE(nn.Module, InvarMixin):
         bombs: torch.Tensor,
         obstacles: torch.Tensor,
         history: torch.Tensor,
-    ):
+    ) -> None:
         for stream, rms in zip(
             [notes, bombs, obstacles],
             [self.note_rms, self.bomb_rms, self.obstacle_rms],
@@ -331,7 +332,7 @@ class CondTransformerGSVAE(nn.Module, InvarMixin):
         encoded_sequence = self.logit_predictor.forward(src=sequence_embeddings, src_key_padding_mask=sequence_mask)
         return self.deproj(encoded_sequence[:, -1])
 
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
+    def decode(self, z: torch.Tensor) -> None:
         return None
 
     def embed_game_obj(self, notes: torch.Tensor, bombs: torch.Tensor, obstacles: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -390,7 +391,7 @@ class CondTransformerGSVAE(nn.Module, InvarMixin):
         n: int = 1,
         temperature: float = 1.0,
         topk: int = 0,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None]:
         logits = self.predict_logits(game, playstyle)
         return self.sample_from_z(logits, n, temperature, topk)
 
@@ -400,7 +401,7 @@ class CondTransformerGSVAE(nn.Module, InvarMixin):
         n: int = 1,
         temperature: float = 1.0,
         topk: int = 0,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None]:
         z = z.reshape(z.shape[0], 1, self.sentence_length, self.vocab_size).repeat_interleave(n, 1)
         if topk > 0:
             topk_values, topk_indices = torch.topk(z, topk, dim=-1)
@@ -425,7 +426,7 @@ class GameplayEncoder(nn.Module, InvarMixin):
         embed_size: int,
         num_heads: int,
         num_layers: int,
-    ):
+    ) -> None:
         super().__init__()
         self.note_size = note_size
         self.bomb_size = bomb_size
@@ -483,7 +484,7 @@ class GameplayEncoder(nn.Module, InvarMixin):
         bombs: torch.Tensor,
         obstacles: torch.Tensor,
         history: torch.Tensor,
-    ):
+    ) -> None:
         for stream, rms in zip(
             [notes, bombs, obstacles],
             [self.note_rms, self.bomb_rms, self.obstacle_rms],
@@ -594,7 +595,7 @@ class SentinelPredictor(nn.Module):
         hidden_size: int,
         num_heads: int,
         num_layers: int,
-    ):
+    ) -> None:
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
@@ -638,7 +639,7 @@ class TransformerGSVAE(nn.Module, InvarMixin):
         stride: int,
         num_heads: int,
         num_layers: int,
-    ):
+    ) -> None:
         super().__init__()
         self.input_size = input_size
         self.effective_input_size = self.input_size // 3
@@ -689,11 +690,11 @@ class TransformerGSVAE(nn.Module, InvarMixin):
         self.input_rms = RunningMeanStd(shape=(self.effective_input_size,))
         self.tau = 1.0
 
-    def setup(self, my_3p: torch.Tensor):
+    def setup(self, my_3p: torch.Tensor) -> None:
         packed_3p = self.pack_invar(my_3p[:, None]).unflatten(-1, (3, -1))
         self.input_rms.update(packed_3p.reshape(-1, self.effective_input_size))
 
-    def encode(self, x: torch.Tensor, w: torch.Tensor = None) -> torch.Tensor:
+    def encode(self, x: torch.Tensor, w: torch.Tensor | None = None) -> torch.Tensor:
         x = self.pack_invar(x).unflatten(-1, (3, -1))
         x = torch.clamp(self.input_rms.normalize(x), -10, 10)
         z = self.proj(x)
@@ -732,7 +733,7 @@ class TransformerGSVAE(nn.Module, InvarMixin):
     def forward(
         self,
         x: torch.Tensor,
-        w: torch.Tensor = None,
+        w: torch.Tensor | None = None,
         n: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         z = self.encode(x, w)
