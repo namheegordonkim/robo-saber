@@ -1,8 +1,6 @@
-from functools import reduce
-
-import torch
 import numpy as np
 import pyvista as pv
+import torch
 from scipy.ndimage import gaussian_filter1d
 from scipy.spatial.transform import Rotation
 from torch import cosine_similarity
@@ -10,15 +8,15 @@ from torch import cosine_similarity
 from beaty_common.pose_utils import sixd_to_quat
 from vendor.poselib.poselib import quat_inverse
 
-from .utils.pose_utils import unity_to_zup, quat_rotate
+from .utils.pose_utils import quat_rotate, unity_to_zup
 
 torch.set_printoptions(precision=3, sci_mode=False)
 
 plane_width = 1.8
 plane_height = 1.05
-plane_left = 0 - plane_width / 2
+plane_left = -plane_width / 2
 plane_bottom = 0
-plane_right = 0 + plane_width / 2
+plane_right = plane_width / 2
 plane_top = plane_height
 note_x_offset = 0.9
 note_y_offset = 0.0
@@ -28,7 +26,6 @@ device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cp
 
 
 class TorchSaber:
-
     @staticmethod
     def evaluate_and_simulate(
         carry_3p: torch.Tensor,
@@ -47,26 +44,14 @@ class TorchSaber:
         njs: float,
         batch_size: int = None,
     ):
-        """
-        Given a batch of 3p trajectories (normalized to match PHC's height) and the sequence of note bags,
-        Evaluate the f1 score of the trajectory, assuming the dimensions of the hitboxes.
-        Many simplifying assumptions are made here, but as a baseline this should be fine.
-
-        my_3p_traj has shape (n_songs, n_cands, n_frames, 27)
-        where the 6-dim feature is xyz and expm
-        note_bags has shape (B, T, 20, 5)
-        where the 5-dim feature is time, x, y, color, angle
-        """
         (
-            note_appeared_yes_mask,
-            bomb_appeared_yes_mask,
-            obstacle_appeared_mask,
-            bomb_collided_yes_mask,
-            head_obstacle_signed_dists,
-            gc_yes_mask,
-            bc_yes_mask,
-            ms_yes_mask,
-            offset_vels,
+            note_appeared_mask,
+            bomb_appeared_mask,
+            bomb_collided_mask,
+            head_obstacle_signed_distances,
+            good_cut_mask,
+            bad_cut_mask,
+            cut_angles,
         ) = TorchSaber.simulate(
             carry_3p,
             my_3p_traj,
@@ -83,115 +68,100 @@ class TorchSaber:
             njs,
             batch_size,
         )
-
-        (
-            normalized_score,
-            n_opportunities,
-            n_hits,
-            n_misses,
-            n_goods,
-            collided_note_masks,
-            bomb_penalty,
-            obstacle_penalty,
-            scores_at_collision,
-            final_good_yes,
-        ) = TorchSaber.evaluate(
+        return TorchSaber.evaluate(
             note_alive_mask.to(device),
-            note_appeared_yes_mask.to(device),
-            bomb_appeared_yes_mask.to(device),
-            bomb_collided_yes_mask.to(device),
-            head_obstacle_signed_dists.to(device),
-            gc_yes_mask.to(device),
-            bc_yes_mask.to(device),
-            offset_vels.to(device),
+            note_appeared_mask.to(device),
+            bomb_appeared_mask.to(device),
+            bomb_collided_mask.to(device),
+            head_obstacle_signed_distances.to(device),
+            good_cut_mask.to(device),
+            bad_cut_mask.to(device),
+            cut_angles.to(device),
         )
-        return normalized_score, n_opportunities, n_hits, n_misses, n_goods, collided_note_masks, bomb_penalty, obstacle_penalty
 
     @staticmethod
     def evaluate(
         note_alive_mask,
-        note_appeared_yes_mask,
-        bomb_appeared_yes_mask,
-        bomb_collided_yes_mask,
-        head_obstacle_signed_dists,
-        gc_yes_mask,
-        bc_yes_mask,
-        degs,
+        note_appeared_mask,
+        bomb_appeared_mask,
+        bomb_collided_mask,
+        head_obstacle_signed_distances,
+        good_cut_mask,
+        bad_cut_mask,
+        cut_angles,
         batch_size: int = None,
     ):
-        max_value = torch.iinfo(torch.int8).max
-        min_value = torch.iinfo(torch.int8).min
+        max_int8 = torch.iinfo(torch.int8).max
+        min_int8 = torch.iinfo(torch.int8).min
+        note_batches = torch.split(
+            torch.arange(note_alive_mask.shape[2], device=device),
+            batch_size if batch_size is not None else note_alive_mask.shape[2],
+        )
 
-        idxs = torch.arange(note_alive_mask.shape[2], device=device)
-        batch_idxs = torch.split(idxs, batch_size if batch_size is not None else note_alive_mask.shape[2])
-
-        n_opportunities = (note_alive_mask & note_appeared_yes_mask.any(-2)).sum(-1)
-        n_hits = 0
-        n_goods = 0
-
-        shape = list(degs.shape[:3])
-        shape += [1]
-        arange_res = torch.arange(degs.shape[2], device=device)[None, None, :, None]
-        res = []
+        n_opportunities = (note_alive_mask & note_appeared_mask.any(-2)).sum(-1)
+        n_hits = torch.zeros_like(n_opportunities)
+        n_goods = torch.zeros_like(n_opportunities)
+        total_score = torch.zeros_like(n_opportunities, dtype=torch.float32)
+        collided_note_batches = []
         pre_window_size = 24
         post_window_size = 24
-        total_score = 0
-        for batch_i in batch_idxs:
-            hit_yes_mask = gc_yes_mask[..., batch_i] | bc_yes_mask[..., batch_i]
-            g = gc_yes_mask[..., batch_i].any(-2)
-            b = bc_yes_mask[..., batch_i].any(-2)
-            good_cumsum = g.cumsum(2, dtype=torch.uint8)
-            bad_cumsum = b.cumsum(2, dtype=torch.uint8)
+        score_shape = list(cut_angles.shape[:3]) + [1]
+        frame_index_grid = torch.arange(cut_angles.shape[2], device=device)[None, None, :, None]
 
-            hit_and_good_mask = ((good_cumsum > 0) & ~(bad_cumsum > 0)).cumsum(2) > 0
-            hit_and_good_mask = hit_and_good_mask & note_alive_mask[..., None, batch_i]
-            final_good_yes = hit_and_good_mask[:, :, -1]
-            hit_and_good_first_mask = hit_and_good_mask.cumsum(2) == 1
+        for note_batch in note_batches:
+            hit_mask = good_cut_mask[..., note_batch] | bad_cut_mask[..., note_batch]
+            any_good_cut = good_cut_mask[..., note_batch].any(-2)
+            any_bad_cut = bad_cut_mask[..., note_batch].any(-2)
+
+            good_cumsum = any_good_cut.cumsum(2, dtype=torch.uint8)
+            bad_cumsum = any_bad_cut.cumsum(2, dtype=torch.uint8)
+            good_run_mask = ((good_cumsum > 0) & ~(bad_cumsum > 0)).cumsum(2) > 0
+            good_run_mask = good_run_mask & note_alive_mask[..., None, note_batch]
+            final_good_mask = good_run_mask[:, :, -1]
+            first_good_frame = good_run_mask.cumsum(2) == 1
 
             torch.cuda.empty_cache()
-            batch_degs = degs[..., batch_i] * 1
-            idxs = torch.arange(pre_window_size, device=device)[None, None].repeat(shape)
-            idxs += arange_res
-            idxs -= pre_window_size
-            idxs = idxs.clamp(0, degs.shape[2] - 1)
-            degs_for_min = batch_degs.nan_to_num(max_value).to(torch.int8)
-            relevant_degs = torch.take_along_dim(degs_for_min.unsqueeze(-2), idxs.unsqueeze(-1), -3)
-            min_degs = relevant_degs.min(-2)[0]
-            del relevant_degs
+            batch_cut_angles = cut_angles[..., note_batch] * 1
+
+            pre_indices = torch.arange(pre_window_size, device=device)[None, None].repeat(score_shape)
+            pre_indices += frame_index_grid
+            pre_indices -= pre_window_size
+            pre_indices = pre_indices.clamp(0, cut_angles.shape[2] - 1)
+            cut_angles_for_min = batch_cut_angles.nan_to_num(max_int8).to(torch.int8)
+            relevant_pre_angles = torch.take_along_dim(cut_angles_for_min.unsqueeze(-2), pre_indices.unsqueeze(-1), -3)
+            min_pre_angles = relevant_pre_angles.min(-2)[0]
+            del relevant_pre_angles
             torch.cuda.empty_cache()
-            min_degs = torch.where(min_degs == max_value, torch.nan, min_degs).to(torch.float)
-            pre_score = torch.clamp(min_degs, min=-100) / -100
+            min_pre_angles = torch.where(min_pre_angles == max_int8, torch.nan, min_pre_angles).to(torch.float)
+            pre_score = torch.clamp(min_pre_angles, min=-100) / -100
             pre_score = torch.clamp(pre_score, max=1.0, min=0.0)
 
-            idxs = torch.arange(post_window_size + 1, device=device)[None, None].repeat(shape)
-            idxs += arange_res
-            idxs = idxs.clamp(0, degs.shape[2] - 1)
-            degs_for_max = batch_degs.nan_to_num(min_value).to(torch.int8)
-            relevant_degs = torch.take_along_dim(degs_for_max.unsqueeze(-2), idxs.unsqueeze(-1), -3)
-            max_degs = relevant_degs.max(-2)[0]
-            del relevant_degs
+            post_indices = torch.arange(post_window_size + 1, device=device)[None, None].repeat(score_shape)
+            post_indices += frame_index_grid
+            post_indices = post_indices.clamp(0, cut_angles.shape[2] - 1)
+            cut_angles_for_max = batch_cut_angles.nan_to_num(min_int8).to(torch.int8)
+            relevant_post_angles = torch.take_along_dim(cut_angles_for_max.unsqueeze(-2), post_indices.unsqueeze(-1), -3)
+            max_post_angles = relevant_post_angles.max(-2)[0]
+            del relevant_post_angles
             torch.cuda.empty_cache()
-            max_degs = torch.where(max_degs == min_value, torch.nan, max_degs).to(torch.float)
-            post_score = torch.clamp(max_degs, max=60) / 60
+            max_post_angles = torch.where(max_post_angles == min_int8, torch.nan, max_post_angles).to(torch.float)
+            post_score = torch.clamp(max_post_angles, max=60) / 60
             post_score = torch.clamp(post_score, max=1.0, min=0.0)
 
-            swing_score = 0.7 * pre_score + 0.3 * post_score  # Accuracy score is not included in the current version.
-            swing_score = torch.where(hit_and_good_first_mask, swing_score, torch.nan)
-            score = swing_score.nansum(-1).nansum(-1).nan_to_num(0)
-            total_score += score
-            n_hits += hit_yes_mask.any(-2).any(2).sum(-1)
-            n_goods += final_good_yes.sum(-1)
+            swing_score = 0.7 * pre_score + 0.3 * post_score
+            swing_score = torch.where(first_good_frame, swing_score, torch.nan)
+            total_score += swing_score.nansum(-1).nansum(-1).nan_to_num(0)
 
-            res.append(swing_score)
+            collided_note_mask = hit_mask.any(-2).any(2)
+            collided_note_batches.append(collided_note_mask)
+            n_hits += collided_note_mask.sum(-1)
+            n_goods += final_good_mask.sum(-1)
 
         denominator = torch.where(n_opportunities == 0, torch.ones_like(n_opportunities), n_opportunities)
         normalized_score = total_score / denominator
-
         n_misses = n_opportunities - n_hits
-        n_bomb_opportunities = bomb_appeared_yes_mask.sum(2).sum(-1)
-        n_bomb_hits = bomb_collided_yes_mask.sum(2).sum(-1)
-        bomb_penalty = n_bomb_hits / (n_bomb_opportunities + 1e-7)
-        obstacle_penalty = head_obstacle_signed_dists.nanmean(-1).nanmean(-1).nan_to_num(10)
+        bomb_penalty = bomb_collided_mask.sum(2).sum(-1) / (bomb_appeared_mask.sum(2).sum(-1) + 1e-7)
+        obstacle_penalty = head_obstacle_signed_distances.nanmean(-1).nanmean(-1).nan_to_num(10)
         obstacle_penalty[obstacle_penalty < 0] = -torch.inf
 
         return (
@@ -200,11 +170,9 @@ class TorchSaber:
             n_hits,
             n_misses,
             n_goods,
-            hit_yes_mask.any(-2).any(-2),
+            torch.cat(collided_note_batches, dim=-1),
             bomb_penalty,
             obstacle_penalty,
-            swing_score,
-            final_good_yes,
         )
 
     @staticmethod
@@ -224,261 +192,211 @@ class TorchSaber:
         njs: float,
         batch_size: int = None,
     ):
-        idxs = torch.arange(my_3p_traj.shape[2], device=device)
-        batch_idxs = torch.split(idxs, batch_size if batch_size is not None else my_3p_traj.shape[2])
+        frame_batches = torch.split(
+            torch.arange(my_3p_traj.shape[2], device=device),
+            batch_size if batch_size is not None else my_3p_traj.shape[2],
+        )
 
-        batch_reses = []
-        n_notes = note_profiles.shape[1]
-        n_bombs = bomb_profiles.shape[1]
-        n_obstacles = obstacle_profiles.shape[1]
-        unique_note_ids = torch.arange(n_notes, device=device)
-        unique_bomb_ids = torch.arange(n_bombs, device=device)
-        unique_obstacle_ids = torch.arange(n_obstacles, device=device)
-        for batch_i in batch_idxs:
-            res = TorchSaber.get_collision_masks(
+        note_appeared_batches = []
+        bomb_appeared_batches = []
+        bomb_collided_batches = []
+        obstacle_distance_batches = []
+        good_cut_batches = []
+        bad_cut_batches = []
+        cut_angle_batches = []
+
+        unique_note_ids = torch.arange(note_profiles.shape[1], device=device)
+        unique_bomb_ids = torch.arange(bomb_profiles.shape[1], device=device)
+        unique_obstacle_ids = torch.arange(obstacle_profiles.shape[1], device=device)
+
+        for frame_batch in frame_batches:
+            (
+                note_appeared_mask,
+                bomb_appeared_mask,
+                bomb_collided_mask,
+                head_obstacle_signed_distances,
+                good_cut_mask,
+                bad_cut_mask,
+                cut_angles,
+            ) = TorchSaber.get_collision_masks(
                 carry_3p,
-                my_3p_traj[:, :, batch_i],
-                note_bags[:, :, batch_i],
-                bomb_bags[:, :, batch_i],
-                obstacle_bags[:, :, batch_i],
-                note_ids[:, :, batch_i],
-                bomb_ids[:, :, batch_i],
-                obstacle_ids[:, :, batch_i],
+                my_3p_traj[:, :, frame_batch],
+                note_bags[:, :, frame_batch],
+                bomb_bags[:, :, frame_batch],
+                obstacle_bags[:, :, frame_batch],
+                note_ids[:, :, frame_batch],
+                bomb_ids[:, :, frame_batch],
+                obstacle_ids[:, :, frame_batch],
                 player_height,
                 unique_note_ids,
                 unique_bomb_ids,
                 unique_obstacle_ids,
                 njs,
             )
-            batch_reses.append(res)
-            carry_3p = my_3p_traj[:, :, batch_i[[-1]]]
-        (
-            note_appeared_yes_mask,
-            bomb_appeared_yes_mask,
-            obstacle_appeared_mask,
-            bomb_collided_yes_mask,
-            head_obstacle_signed_dists,
-            gc_yes_mask,
-            bc_yes_mask,
-            ms_yes_mask,
-            offset_vels,
-        ) = list(reduce(lambda acc, res: [torch.cat([a, r], dim=2) for a, r in zip(acc, res)], batch_reses))
+            note_appeared_batches.append(note_appeared_mask)
+            bomb_appeared_batches.append(bomb_appeared_mask)
+            bomb_collided_batches.append(bomb_collided_mask)
+            obstacle_distance_batches.append(head_obstacle_signed_distances)
+            good_cut_batches.append(good_cut_mask)
+            bad_cut_batches.append(bad_cut_mask)
+            cut_angle_batches.append(cut_angles)
+            carry_3p = my_3p_traj[:, :, frame_batch[[-1]]]
+
         return (
-            note_appeared_yes_mask,
-            bomb_appeared_yes_mask,
-            obstacle_appeared_mask,
-            bomb_collided_yes_mask,
-            head_obstacle_signed_dists,
-            gc_yes_mask,
-            bc_yes_mask,
-            ms_yes_mask,
-            offset_vels,
+            torch.cat(note_appeared_batches, dim=2),
+            torch.cat(bomb_appeared_batches, dim=2),
+            torch.cat(bomb_collided_batches, dim=2),
+            torch.cat(obstacle_distance_batches, dim=2),
+            torch.cat(good_cut_batches, dim=2),
+            torch.cat(bad_cut_batches, dim=2),
+            torch.cat(cut_angle_batches, dim=2),
         )
 
     @staticmethod
-    def get_note_verts_and_normals_and_quats(note_bags: torch.Tensor, player_height: float, njs: float, type: int):
-        """
-        Return transformed note box vertices, face normals, and quaternions.
-        """
-        n_songs, n_cands, n_frames, n_notes, *rest = note_bags.shape
-        if type == 0:  # good cut collider
+    def get_note_verts_and_normals_and_quats(note_bags: torch.Tensor, player_height: float, njs: float, collider_type: int):
+        n_songs, n_cands, n_frames, n_notes = note_bags.shape[:4]
+        if collider_type == 0:
             note_collider_mesh = pv.Cube(x_length=1.0, y_length=0.8, z_length=0.5)
-        elif type == 1:  # dot collider
+        elif collider_type == 1:
             note_collider_mesh = pv.Cube(x_length=1.0, y_length=0.8, z_length=0.8)
         else:
             note_collider_mesh = pv.Cube(x_length=0.4, y_length=0.4, z_length=0.4)
 
-        note_collider_verts = torch.tensor(note_collider_mesh.points, dtype=torch.float, device=device)
-        note_verts = note_collider_verts[None, None, None, None].repeat(n_songs, n_cands, n_frames, n_notes, 1, 1)
+        note_vertices = torch.tensor(note_collider_mesh.points, dtype=torch.float, device=device)
+        note_vertices = note_vertices[None, None, None, None].repeat(n_songs, n_cands, n_frames, n_notes, 1, 1)
 
         note_angle_degrees = np.array([0, 180, -90, 90, -45, 45, -135, 135, 0])
-        tmp = note_bags.detach().cpu().numpy() * 1
-        tmp = np.where(np.isnan(tmp), 0, tmp)
-        tmp = tmp.astype(int)
+        note_values = note_bags.detach().cpu().numpy() * 1
+        note_values = np.where(np.isnan(note_values), 0, note_values).astype(int)
         note_angles = np.where(
             np.isnan(note_bags[..., -2].detach().cpu().numpy()),
             np.nan,
-            note_angle_degrees[tmp[..., -2]],
+            note_angle_degrees[note_values[..., -2]],
         )
-        note_quat = Rotation.from_euler("x", note_angles.reshape(-1), degrees=True).as_quat().reshape((n_songs, n_cands, n_frames, n_notes, 4))
-        note_quat = torch.tensor(note_quat, dtype=torch.float, device=device)
-        note_verts = quat_rotate(
-            note_quat[..., None, :].repeat_interleave(8, -2),
-            note_verts,
-        )
+        note_quats = Rotation.from_euler("x", note_angles.reshape(-1), degrees=True).as_quat()
+        note_quats = torch.tensor(note_quats.reshape(n_songs, n_cands, n_frames, n_notes, 4), dtype=torch.float, device=device)
+        note_vertices = quat_rotate(note_quats[..., None, :].repeat_interleave(8, -2), note_vertices)
 
-        note_collider_normals = torch.tensor(note_collider_mesh.face_normals, dtype=torch.float, device=device)
-        note_face_normals = note_collider_normals[None, None, None, None].repeat(n_songs, n_cands, n_frames, n_notes, 1, 1)
-        note_face_normals = quat_rotate(
-            note_quat[..., None, :].repeat_interleave(6, -2),
-            note_face_normals,
-        )
+        note_normals = torch.tensor(note_collider_mesh.face_normals, dtype=torch.float, device=device)
+        note_normals = note_normals[None, None, None, None].repeat(n_songs, n_cands, n_frames, n_notes, 1, 1)
+        note_normals = quat_rotate(note_quats[..., None, :].repeat_interleave(6, -2), note_normals)
 
         plane_grid = np.array(
             np.meshgrid(
-                np.linspace(plane_right, plane_left, 4),  # note: left and right are flipped for unity
+                np.linspace(plane_right, plane_left, 4),
                 np.linspace(plane_bottom, plane_top, 3),
             )
         ).transpose((2, 1, 0))
         plane_grid = torch.tensor(plane_grid, dtype=torch.float, device=device)
 
-        note_pos = plane_grid[tmp[..., 3], tmp[..., 4]]
-        note_pos = torch.concatenate([note_bags[..., [0]] * njs + note_x_offset, note_pos], dim=-1)
+        note_positions = plane_grid[note_values[..., 3], note_values[..., 4]]
+        note_positions = torch.concatenate([note_bags[..., [0]] * njs + note_x_offset, note_positions], dim=-1)
+        note_positions[..., 1] += note_y_offset
+        note_positions[..., 2] += player_height / 2
+        note_positions[..., 2] += note_z_offset
 
-        note_pos[..., 1] += note_y_offset
-        note_pos[..., 2] += player_height / 2
-        note_pos[..., 2] += note_z_offset
-        note_verts += note_pos[..., None, :]
-        if type == 0 or type == 1:
-            note_verts[..., 0] -= 0.25
+        note_vertices += note_positions[..., None, :]
+        if collider_type == 0 or collider_type == 1:
+            note_vertices[..., 0] -= 0.25
 
-        return note_verts, note_face_normals, note_quat
+        return note_vertices, note_normals, note_quats
 
     @staticmethod
     def get_obstacle_verts_and_normals(obstacle_bags: torch.Tensor, player_height: float, njs: float):
-        """
-        Return transformed obstacle box vertices and face normals.
-        """
-        n_songs, n_cands, n_frames, n_obstacles, *rest = obstacle_bags.shape
-        tmp = obstacle_bags.detach().cpu().numpy() * 1
-        tmp = np.where(np.isnan(tmp), 0, tmp)
-        tmp = tmp.astype(int)
+        n_songs, n_cands, n_frames, n_obstacles = obstacle_bags.shape[:4]
+        obstacle_values = obstacle_bags.detach().cpu().numpy() * 1
+        obstacle_values = np.where(np.isnan(obstacle_values), 0, obstacle_values).astype(int)
 
-        plane_leftright = np.linspace(plane_right, plane_left, 4)  # note: left and right are flipped for unity
+        plane_leftright = np.linspace(plane_right, plane_left, 4)
         plane_bottomtop = np.linspace(plane_bottom, plane_top, 3)
         plane_width_interval = plane_leftright[0] - plane_leftright[1]
         plane_height_interval = plane_bottomtop[1] - plane_bottomtop[0]
-
-        plane_grid = np.array(
-            np.meshgrid(
-                plane_leftright,
-                plane_bottomtop,
-            )
-        ).transpose((2, 1, 0))
+        plane_grid = np.array(np.meshgrid(plane_leftright, plane_bottomtop)).transpose((2, 1, 0))
         plane_grid = torch.tensor(plane_grid, dtype=torch.float, device=device)
 
-        obstacle_collider_mesh = pv.Cube(x_length=0.4, y_length=plane_width_interval, z_length=plane_height_interval)
-        obstacle_collider_verts = torch.tensor(obstacle_collider_mesh.points, dtype=torch.float, device=device)
-        obstacle_verts = obstacle_collider_verts[None, None, None, None].repeat(n_songs, n_cands, n_frames, n_obstacles, 1, 1)
+        obstacle_mesh = pv.Cube(x_length=0.4, y_length=plane_width_interval, z_length=plane_height_interval)
+        obstacle_vertices = torch.tensor(obstacle_mesh.points, dtype=torch.float, device=device)
+        obstacle_vertices = obstacle_vertices[None, None, None, None].repeat(n_songs, n_cands, n_frames, n_obstacles, 1, 1)
 
-        obstacle_pos = plane_grid[0, 0] + (plane_grid[1, 1] - plane_grid[0, 0]) * torch.as_tensor(tmp[..., [5, 6]], device=device)
-        obstacle_pos = torch.concatenate([obstacle_bags[..., [0]] * njs + note_x_offset, obstacle_pos], dim=-1)
-        obstacle_pos[..., 2] += player_height / 2
-        obstacle_pos[..., 2] += note_z_offset
-        obstacle_pos[..., 1] += note_y_offset
-        obstacle_verts[..., [1, 2]] += obstacle_pos[..., None, [1, 2]]
+        obstacle_positions = plane_grid[0, 0] + (plane_grid[1, 1] - plane_grid[0, 0]) * torch.as_tensor(
+            obstacle_values[..., [5, 6]],
+            device=device,
+        )
+        obstacle_positions = torch.concatenate([obstacle_bags[..., [0]] * njs + note_x_offset, obstacle_positions], dim=-1)
+        obstacle_positions[..., 2] += player_height / 2
+        obstacle_positions[..., 2] += note_z_offset
+        obstacle_positions[..., 1] += note_y_offset
+        obstacle_vertices[..., [1, 2]] += obstacle_positions[..., None, [1, 2]]
 
-        obstacle_verts[..., 0] = obstacle_bags[..., [0]] * njs + note_x_offset
-        obstacle_verts[..., -4:, 0] += obstacle_bags[..., [4]] * njs + note_x_offset
-        obstacle_verts[..., [1, 2, 6, 7], 2] += (obstacle_bags[..., [-1]] - 1) * plane_height_interval
+        obstacle_vertices[..., 0] = obstacle_bags[..., [0]] * njs + note_x_offset
+        obstacle_vertices[..., -4:, 0] += obstacle_bags[..., [4]] * njs + note_x_offset
+        obstacle_vertices[..., [1, 2, 6, 7], 2] += (obstacle_bags[..., [-1]] - 1) * plane_height_interval
+        obstacle_vertices[..., [0, 1, 4, 7], 1] = (
+            obstacle_vertices[..., [2, 3, 5, 6], 1] - obstacle_bags[..., [-2]] * plane_width_interval
+        )
+        obstacle_vertices[obstacle_vertices.isnan().any(-1)] = torch.nan
 
-        obstacle_verts[..., [0, 1, 4, 7], 1] = obstacle_verts[..., [2, 3, 5, 6], 1] - (obstacle_bags[..., [-2]] - 0) * plane_width_interval
-
-        obstacle_verts[obstacle_verts.isnan().any(-1)] = torch.nan
-
-        obstacle_collider_normals = torch.tensor(obstacle_collider_mesh.face_normals, dtype=torch.float, device=device)
-        obstacle_face_normals = obstacle_collider_normals[None, None, None, None].repeat(n_songs, n_cands, n_frames, n_obstacles, 1, 1)
-        obstacle_face_normals[obstacle_verts.isnan().any(-1).any(-1)] = torch.nan
-
-        return obstacle_verts, obstacle_face_normals
+        obstacle_normals = torch.tensor(obstacle_mesh.face_normals, dtype=torch.float, device=device)
+        obstacle_normals = obstacle_normals[None, None, None, None].repeat(n_songs, n_cands, n_frames, n_obstacles, 1, 1)
+        obstacle_normals[obstacle_vertices.isnan().any(-1).any(-1)] = torch.nan
+        return obstacle_vertices, obstacle_normals
 
     @staticmethod
-    def box_box_collision_from_verts_and_normals(verts1: torch.Tensor, normals1: torch.Tensor, verts2: torch.Tensor, normals2: torch.Tensor):
-        edge_idxs = pv.Cube().regular_faces.reshape(-1, 2)
-        edges1 = verts1[..., edge_idxs[:, 0], :] - verts1[..., edge_idxs[:, 1], :]
-        edges2 = verts2[..., edge_idxs[:, 0], :] - verts2[..., edge_idxs[:, 1], :]
-        edge_crosses = (
-            torch.cross(
-                edges1.unsqueeze(-3).unsqueeze(-2),
-                edges2.unsqueeze(-4).unsqueeze(-3),
-                dim=-1,
-            )
-            .contiguous()
-        )
-        edge_crosses = edge_crosses.flatten(-3, -2)
-        all_cand_axes_across_time = torch.concatenate(
-            [
-                edge_crosses,
-                normals1.unsqueeze(-3).repeat_interleave(normals2.shape[-3], -3),
-                normals2.unsqueeze(-4).repeat_interleave(normals1.shape[-3], -4),
-            ],
-            dim=-2,
-        )
-        all_cand_axes_across_time /= torch.norm(all_cand_axes_across_time, dim=-1, keepdim=True) + 1e-10
+    def box_trail_collision_from_verts(
+        box_verts: torch.Tensor,
+        box_quats: torch.Tensor,
+        saber_xyzs: torch.Tensor,
+        saber_quats: torch.Tensor,
+    ):
+        n_songs, n_cands, n_frames = box_verts.shape[:3]
+        note_positions = box_verts.mean(-2)
 
-        proj1 = torch.sum(
-            verts1.unsqueeze(-3).unsqueeze(-3) * all_cand_axes_across_time.unsqueeze(-2),
-            dim=-1,
-        )
-        proj2 = torch.sum(
-            verts2.unsqueeze(-4).unsqueeze(-3) * all_cand_axes_across_time.unsqueeze(-2),
-            dim=-1,
-        )
-        min1 = proj1.min(-1)[0]
-        max1 = proj1.max(-1)[0]
-        min2 = proj2.min(-1)[0]
-        max2 = proj2.max(-1)[0]
-        collide_yes = torch.all(max1 >= min2, dim=-1) & torch.all(max2 >= min1, dim=-1)
-        return collide_yes
+        saber_xyz_pairs = torch.stack([saber_xyzs[:, :, :-1], saber_xyzs[:, :, 1:]], -2)
+        saber_quat_pairs = torch.stack([saber_quats[:, :, :-1], saber_quats[:, :, 1:]], -2)
 
-    @staticmethod
-    def box_trail_collision_from_verts(box_verts: torch.Tensor, box_quats: torch.Tensor, saber_xyzs: torch.Tensor, saber_quats: torch.Tensor):
-        n_songs, n_cands, n_frames, *rest = box_verts.shape
-        note_pos = box_verts.mean(-2)
+        hilt_positions = saber_xyz_pairs
+        tip_offset = torch.tensor([[[[[1.0, 0, 0]]]]], dtype=torch.float, device=device).repeat(n_songs, n_cands, n_frames, 2, 2, 1)
+        tip_positions = hilt_positions + quat_rotate(saber_quat_pairs.contiguous(), tip_offset)
 
-        saber_xyzs_prevcur = torch.stack([saber_xyzs[:, :, :-1], saber_xyzs[:, :, 1:]], -2)
-        saber_quats_prevcur = torch.stack([saber_quats[:, :, :-1], saber_quats[:, :, 1:]], -2)
+        note_to_hilt = hilt_positions.unsqueeze(-2) - note_positions.unsqueeze(-3).unsqueeze(-3)
+        note_to_tip = tip_positions.unsqueeze(-2) - note_positions.unsqueeze(-3).unsqueeze(-3)
+        note_quats = box_quats.unsqueeze(-3).unsqueeze(-3).repeat(1, 1, 1, 2, 2, 1, 1)
+        inverse_note_quats = quat_inverse(note_quats)
+        hilt_local = quat_rotate(inverse_note_quats, note_to_hilt)
+        tip_local = quat_rotate(inverse_note_quats, note_to_tip)
 
-        hilt = saber_xyzs_prevcur
-        tip = torch.tensor([[[[[1.0, 0, 0]]]]], dtype=torch.float, device=device).repeat(n_songs, n_cands, n_frames, 2, 2, 1)
-        tip = hilt + quat_rotate(saber_quats_prevcur.contiguous(), tip)
+        repeated_box_verts = box_verts.unsqueeze(-4).repeat_interleave(2, 3)
+        repeated_box_quats = box_quats.unsqueeze(-2).unsqueeze(-4).repeat(1, 1, 1, 2, 1, 8, 1)
+        inverse_box_quats = quat_inverse(repeated_box_quats)
+        repeated_box_positions = repeated_box_verts.mean(-2, keepdim=True)
+        unrotated_box_verts = quat_rotate(inverse_box_quats, repeated_box_verts - repeated_box_positions)
 
-        note_to_hilt = hilt.unsqueeze(-2) - note_pos.unsqueeze(-3).unsqueeze(-3)
-        note_to_tip = tip.unsqueeze(-2) - note_pos.unsqueeze(-3).unsqueeze(-3)
-        note_quat_repped = box_quats.unsqueeze(-3).unsqueeze(-3).repeat(1, 1, 1, 2, 2, 1, 1)
-        inv_note_quat_repped = quat_inverse(note_quat_repped)
-        hilt_loc = quat_rotate(inv_note_quat_repped, note_to_hilt)
-        tip_loc = quat_rotate(inv_note_quat_repped, note_to_tip)
+        hilt_to_tip = tip_local - hilt_local
+        lerp_shape = [1] * (len(tip_positions.shape) + 1)
+        lerp_shape[-2] = -1
+        sampled_tip_positions = hilt_local.unsqueeze(-2) + hilt_to_tip.unsqueeze(-2) * torch.linspace(0, 1, 5, device=device).view(lerp_shape)
+        sampled_tip_start = sampled_tip_positions[:, :, :, :, 0]
+        sampled_tip_end = sampled_tip_positions[:, :, :, :, 1]
+        sampled_tip_delta = sampled_tip_end - sampled_tip_start
 
-        note_verts_repped = box_verts.unsqueeze(-4).repeat_interleave(2, 3)
-        note_quat_repped = box_quats.unsqueeze(-2).unsqueeze(-4).repeat(1, 1, 1, 2, 1, 8, 1)
-        inv_note_quat_repped = quat_inverse(note_quat_repped)
-        note_pos_repped = note_verts_repped.mean(-2, keepdim=True)
-        note_verts_unrotated = quat_rotate(inv_note_quat_repped, note_verts_repped - note_pos_repped)
+        box_mins = unrotated_box_verts.min(-2)[0]
+        box_maxs = unrotated_box_verts.max(-2)[0]
 
-        hilt_tip = tip_loc - hilt_loc
-        shape = [1] * (len(tip.shape) + 1)
-        shape[-2] = -1
-        hilt_tip_lerp = hilt_loc.unsqueeze(-2) + hilt_tip.unsqueeze(-2) * torch.linspace(0, 1, 5, device=device).view(shape)
+        slab_entries = (box_mins.unsqueeze(-2) - sampled_tip_start) / sampled_tip_delta
+        slab_exits = (box_maxs.unsqueeze(-2) - sampled_tip_start) / sampled_tip_delta
+        near_hits = torch.minimum(slab_entries, slab_exits)
+        far_hits = torch.maximum(slab_entries, slab_exits)
+        entry_time = near_hits.max(-1)[0]
+        exit_time = far_hits.min(-1)[0]
 
-        hilt_tip_lerp_0 = hilt_tip_lerp[:, :, :, :, 0]
-        hilt_tip_lerp_1 = hilt_tip_lerp[:, :, :, :, 1]
-        hilt_tip_lerp_01 = hilt_tip_lerp_1 - hilt_tip_lerp_0
+        ray_collision_mask = entry_time < exit_time
+        in_segment_mask = ((entry_time > 0) & (entry_time < 1)) | ((exit_time > 0) & (exit_time < 1))
+        saber_box_collision_mask = torch.any(ray_collision_mask & in_segment_mask, dim=-1)
 
-        note_slab_mins = note_verts_unrotated.min(-2)[0]
-        note_slab_maxs = note_verts_unrotated.max(-2)[0]
-
-        slab_entries = (note_slab_mins.unsqueeze(-2) - hilt_tip_lerp_0) / hilt_tip_lerp_01
-        slab_exits = (note_slab_maxs.unsqueeze(-2) - hilt_tip_lerp_0) / hilt_tip_lerp_01
-
-        earlier = torch.minimum(slab_entries, slab_exits)
-        later = torch.maximum(slab_entries, slab_exits)
-        tclose = earlier.max(-1)[0]
-        tfar = later.min(-1)[0]
-        ray_collide_yes = tclose < tfar
-        range_yes = torch.logical_or((tclose > 0) & (tclose < 1), (tfar > 0) & (tfar < 1))
-
-        saber_note_collision_yeses = torch.any(ray_collide_yes & range_yes, dim=-1)
-
-        interior_yeses = ((hilt_tip_lerp_1 > note_slab_mins.unsqueeze(-2)) & (hilt_tip_lerp_1 < note_slab_maxs.unsqueeze(-2))).all(-1).any(-1)
-
-        return saber_note_collision_yeses | interior_yeses
-
-    @staticmethod
-    def box_point_collision_from_verts_and_normals(box_verts: torch.Tensor, box_normals: torch.Tensor, box_quats: torch.Tensor, point_xyzs: torch.Tensor):
-        n_songs, n_cands, n_frames, *rest = box_verts.shape
-        note_pos = box_verts.mean(-2)
-        pass
+        interior_collision_mask = (
+            (sampled_tip_end > box_mins.unsqueeze(-2)) & (sampled_tip_end < box_maxs.unsqueeze(-2))
+        ).all(-1).any(-1)
+        return saber_box_collision_mask | interior_collision_mask
 
     @staticmethod
     def get_collision_masks(
@@ -496,170 +414,111 @@ class TorchSaber:
         unique_obstacle_ids: torch.Tensor,
         njs: float,
     ):
-        n_songs, n_cands, n_frames, *rest = my_3p_traj.shape
+        n_songs, n_cands, n_frames = my_3p_traj.shape[:3]
         n_notes = note_bags.shape[-2]
-        my_3p_traj_ = torch.cat([carry_3p, my_3p_traj], dim=2)
+        full_trajectory = torch.cat([carry_3p, my_3p_traj], dim=2)
 
         note_gc_verts, _, note_gc_quats = TorchSaber.get_note_verts_and_normals_and_quats(note_bags, player_height, njs, 0)
         note_bc_verts, _, note_bc_quats = TorchSaber.get_note_verts_and_normals_and_quats(note_bags, player_height, njs, 2)
-        bomb_verts, bomb_collider_normals_across_time, bomb_quats = TorchSaber.get_note_verts_and_normals_and_quats(bomb_bags, player_height, njs, 2)
+        bomb_verts, _, bomb_quats = TorchSaber.get_note_verts_and_normals_and_quats(bomb_bags, player_height, njs, 2)
+        obstacle_verts, obstacle_normals = TorchSaber.get_obstacle_verts_and_normals(obstacle_bags, player_height, njs)
 
-        obstacle_verts_across_time, obstacle_normals_across_time = TorchSaber.get_obstacle_verts_and_normals(obstacle_bags, player_height, njs)
+        note_values = note_bags.detach().cpu().numpy() * 1
+        note_values = np.where(np.isnan(note_values), 0, note_values).astype(int)
 
-        tmp = note_bags.detach().cpu().numpy() * 1
-        tmp = np.where(np.isnan(tmp), 0, tmp)
-        tmp = tmp.astype(int)
-        my_3p_xyz, my_3p_sixd = (
-            my_3p_traj_[..., :3] * 1,
-            my_3p_traj_[..., 3:] * 1,
-        )
-        my_3p_quat = sixd_to_quat(my_3p_sixd)
-        my_3p_xyz, my_3p_quat = unity_to_zup(my_3p_xyz, my_3p_quat)
-        saber_xyzs = my_3p_xyz[..., [1, 2], :]
-        saber_quats = my_3p_quat[..., [1, 2], :]
+        trajectory_xyz = full_trajectory[..., :3] * 1
+        trajectory_sixd = full_trajectory[..., 3:] * 1
+        trajectory_quat = sixd_to_quat(trajectory_sixd)
+        trajectory_xyz, trajectory_quat = unity_to_zup(trajectory_xyz, trajectory_quat)
+        saber_xyz = trajectory_xyz[..., [1, 2], :]
+        saber_quat = trajectory_quat[..., [1, 2], :]
 
-        saber_gc_collision_yeses = TorchSaber.box_trail_collision_from_verts(note_gc_verts, note_gc_quats, saber_xyzs, saber_quats)
-        saber_bc_collision_yeses = TorchSaber.box_trail_collision_from_verts(note_bc_verts, note_bc_quats, saber_xyzs, saber_quats)
-        saber_bomb_collision_yeses = TorchSaber.box_trail_collision_from_verts(bomb_verts, bomb_quats, saber_xyzs, saber_quats)
+        good_cut_collision = TorchSaber.box_trail_collision_from_verts(note_gc_verts, note_gc_quats, saber_xyz, saber_quat)
+        bad_cut_collision = TorchSaber.box_trail_collision_from_verts(note_bc_verts, note_bc_quats, saber_xyz, saber_quat)
+        bomb_collision = TorchSaber.box_trail_collision_from_verts(bomb_verts, bomb_quats, saber_xyz, saber_quat)
 
-        colors = tmp[..., -3]
-        color_onehots = torch.eye(2, dtype=torch.bool, device=device)[colors].swapaxes(-2, -1)
-        color_yes_across_time = saber_gc_collision_yeses & color_onehots
-        color_bad_across_time = saber_bc_collision_yeses & ~color_onehots
+        note_colors = note_values[..., -3]
+        color_onehots = torch.eye(2, dtype=torch.bool, device=device)[note_colors].swapaxes(-2, -1)
+        matching_color_collision = good_cut_collision & color_onehots
+        wrong_color_collision = bad_cut_collision & ~color_onehots
 
-        tip = torch.tensor([[[[[1.0, 0, 0]]]]], dtype=torch.float, device=device).repeat(n_songs, n_cands, n_frames + 1, 2, 1)
-        hilt_tip = quat_rotate(saber_quats.contiguous(), tip)
-        tip = saber_xyzs + hilt_tip
+        saber_tip_offset = torch.tensor([[[[[1.0, 0, 0]]]]], dtype=torch.float, device=device).repeat(n_songs, n_cands, n_frames + 1, 2, 1)
+        saber_tip_offset = quat_rotate(saber_quat.contiguous(), saber_tip_offset)
+        saber_tip_positions = saber_xyz + saber_tip_offset
 
-        if tip.shape[2] > 1:
-            offset_vels = np.gradient(tip.detach().cpu().numpy(), axis=2) * 60
-            offset_vels = torch.as_tensor(gaussian_filter1d(offset_vels, 2, axis=2, mode="nearest"), device=tip.device)
-            offset_vels = offset_vels[:, :, 1:]
+        if saber_tip_positions.shape[2] > 1:
+            offset_velocities = np.gradient(saber_tip_positions.detach().cpu().numpy(), axis=2) * 60
+            offset_velocities = gaussian_filter1d(offset_velocities, 2, axis=2, mode="nearest")
+            offset_velocities = torch.as_tensor(offset_velocities, device=saber_tip_positions.device)[:, :, 1:]
         else:
-            offset_vels = tip * 0
-        offset_vels[..., 0] = 0
-        normalized_offset_vels = offset_vels / (offset_vels.norm(dim=-1, keepdim=True) + 1e-10)
+            offset_velocities = saber_tip_positions * 0
+        offset_velocities[..., 0] = 0
+        normalized_offset_velocities = offset_velocities / (offset_velocities.norm(dim=-1, keepdim=True) + 1e-10)
 
-        cut_dir_vecs_across_time = torch.tensor([[[[[0, 0, 1]]]]], dtype=torch.float, device=device).repeat(n_songs, n_cands, n_frames, n_notes, 1)
-        cut_dir_vecs_across_time = quat_rotate(note_gc_quats, cut_dir_vecs_across_time)
-        one_zero_zero = torch.zeros_like(cut_dir_vecs_across_time, device=device)
+        cut_direction_vectors = torch.tensor([[[[[0, 0, 1]]]]], dtype=torch.float, device=device).repeat(
+            n_songs,
+            n_cands,
+            n_frames,
+            n_notes,
+            1,
+        )
+        cut_direction_vectors = quat_rotate(note_gc_quats, cut_direction_vectors)
+        one_zero_zero = torch.zeros_like(cut_direction_vectors, device=device)
         one_zero_zero[..., 0] = 1
-        zero_one_zero = torch.zeros_like(cut_dir_vecs_across_time, device=device)
+        zero_one_zero = torch.zeros_like(cut_direction_vectors, device=device)
         zero_one_zero[..., 1] = 1
-        basis = torch.stack([one_zero_zero, cut_dir_vecs_across_time], dim=-2)
-        projs = torch.einsum("...ab,...b->...a", basis.unsqueeze(-4), hilt_tip[:, :, 1:].unsqueeze(-2))
-        projs_with_third_zero = torch.cat([projs, torch.zeros_like(projs[..., [0]])], dim=-1)
-        cossims = cosine_similarity(one_zero_zero[:, :, :, None], projs_with_third_zero, dim=-1)
-        arccoss = torch.acos(cossims)
-        signs = torch.sign(torch.sum(zero_one_zero[:, :, :, None] * projs_with_third_zero, dim=-1))
-        degs = signs * arccoss * 180 / np.pi
-        degs = degs.to(torch.float16)
-        degs = torch.take_along_dim(degs, torch.as_tensor(colors[..., None, :], device=device), dim=-2)[..., 0, :]
 
-        dots_across_time = torch.sum(cut_dir_vecs_across_time.unsqueeze(-3) * normalized_offset_vels.unsqueeze(-2), dim=-1)
-        direction_yes_across_time = torch.logical_or(dots_across_time > 0.0, note_bags[..., [-2, -2]].swapaxes(-1, -2) == 8)
-        direction_bad_across_time = ~direction_yes_across_time
+        cut_basis = torch.stack([one_zero_zero, cut_direction_vectors], dim=-2)
+        hilt_tip_projection = torch.einsum("...ab,...b->...a", cut_basis.unsqueeze(-4), saber_tip_offset[:, :, 1:].unsqueeze(-2))
+        hilt_tip_projection = torch.cat([hilt_tip_projection, torch.zeros_like(hilt_tip_projection[..., [0]])], dim=-1)
+        cosine_values = cosine_similarity(one_zero_zero[:, :, :, None], hilt_tip_projection, dim=-1)
+        cut_angles = torch.sign(torch.sum(zero_one_zero[:, :, :, None] * hilt_tip_projection, dim=-1))
+        cut_angles = cut_angles * torch.acos(cosine_values) * 180 / np.pi
+        cut_angles = cut_angles.to(torch.float16)
+        cut_angles = torch.take_along_dim(cut_angles, torch.as_tensor(note_colors[..., None, :], device=device), dim=-2)[..., 0, :]
 
-        bc_yes_across_time = saber_bc_collision_yeses & (color_bad_across_time | direction_bad_across_time)
-        gc_yes_across_time = saber_gc_collision_yeses & color_yes_across_time & direction_yes_across_time
-        ms_yes_across_time = ~(bc_yes_across_time | gc_yes_across_time)
+        velocity_alignment = torch.sum(
+            cut_direction_vectors.unsqueeze(-3) * normalized_offset_velocities.unsqueeze(-2),
+            dim=-1,
+        )
+        good_direction = (velocity_alignment > 0.0) | (note_bags[..., [-2, -2]].swapaxes(-1, -2) == 8)
+        bad_direction = ~good_direction
+
+        bad_cut_across_time = bad_cut_collision & (wrong_color_collision | bad_direction)
+        good_cut_across_time = good_cut_collision & matching_color_collision & good_direction
 
         note_appeared_global_to_local = unique_note_ids[None, None, None, :, None] == note_ids[..., None, :]
         note_appeared_local_to_global = note_appeared_global_to_local.swapaxes(-2, -1)
-        note_appeared_yes_mask = note_appeared_global_to_local.any(-1).detach().cpu()
+        note_appeared_mask = note_appeared_global_to_local.any(-1).detach().cpu()
 
-        bomb_appeared_yes_mask = (unique_bomb_ids[None, None, None, :, None] == bomb_ids[..., None, :]).any(-1).detach().cpu()
-        obstacle_appeared_global_to_local = unique_obstacle_ids[None, None, None, :, None] == obstacle_ids[..., None, :]
-        obstacle_appeared_yes_mask = obstacle_appeared_global_to_local.any(-1).detach().cpu()
+        bomb_appeared_mask = (unique_bomb_ids[None, None, None, :, None] == bomb_ids[..., None, :]).any(-1).detach().cpu()
+        bomb_collided_ids = torch.where(bomb_collision.any(-2), bomb_ids, torch.nan)
+        bomb_collided_mask = (unique_bomb_ids[None, None, None, :, None] == bomb_collided_ids[..., None, :]).any(-1).detach().cpu()
 
-        bomb_collided_idx = torch.where(saber_bomb_collision_yeses.any(-2), bomb_ids, torch.nan)
-        bomb_collided_yes_mask = (unique_bomb_ids[None, None, None, :, None] == bomb_collided_idx[..., None, :]).any(-1).detach().cpu()
-        head_xyzs = my_3p_xyz[:, :, 1:, [0]]
-        obst_mins = obstacle_verts_across_time.min(-2)[0]
-        obst_maxs = obstacle_verts_across_time.max(-2)[0]
-        head_obst_yes = torch.all((head_xyzs > obst_mins) & (head_xyzs < obst_maxs), dim=-1)
+        head_xyz = trajectory_xyz[:, :, 1:, [0]]
+        obstacle_mins = obstacle_verts.min(-2)[0]
+        obstacle_maxs = obstacle_verts.max(-2)[0]
+        head_inside_obstacle = torch.all((head_xyz > obstacle_mins) & (head_xyz < obstacle_maxs), dim=-1)
+        obstacle_centers = obstacle_verts.mean(-2)
+        obstacle_to_head = head_xyz - obstacle_centers
+        head_obstacle_dots = torch.sum((obstacle_to_head[..., None, :] * obstacle_normals)[..., [1, 2]], dim=-1)
+        head_obstacle_distances = head_obstacle_dots.max(-1)[0]
+        head_obstacle_signed_distances = head_obstacle_distances * torch.where(head_inside_obstacle, 0, 1)
 
-        obst_xyzs = obstacle_verts_across_time.mean(-2)
-        obst_to_head = head_xyzs - obst_xyzs
-        head_obst_dots_yz = torch.sum((obst_to_head[..., None, :] * obstacle_normals_across_time)[..., [1, 2]], dim=-1)
-        head_obst_dist_yz = head_obst_dots_yz.max(-1)[0]
+        good_cut_note_ids = torch.where(good_cut_across_time, note_ids.unsqueeze(-2), torch.nan)
+        good_cut_mask = (unique_note_ids[None, None, None, :, None] == good_cut_note_ids[..., None, :]).any(-1).detach().cpu()
+        bad_cut_note_ids = torch.where(bad_cut_across_time, note_ids.unsqueeze(-2), torch.nan)
+        bad_cut_mask = (unique_note_ids[None, None, None, :, None] == bad_cut_note_ids[..., None, :]).any(-1).detach().cpu()
 
-        head_obstacle_signed_dists = head_obst_dist_yz * torch.where(head_obst_yes, 0, 1)
-
-        gc_note_ids = torch.where(gc_yes_across_time, note_ids.unsqueeze(-2), torch.nan)
-        gc_yes_masks = (unique_note_ids[None, None, None, :, None] == gc_note_ids[..., None, :]).any(-1).detach().cpu()
-        bc_note_ids = torch.where(bc_yes_across_time, note_ids.unsqueeze(-2), torch.nan)
-        bc_yes_masks = (unique_note_ids[None, None, None, :, None] == bc_note_ids[..., None, :]).any(-1).detach().cpu()
-        ms_note_ids = torch.where(ms_yes_across_time, note_ids.unsqueeze(-2), torch.nan)
-        ms_yes_masks = (unique_note_ids[None, None, None, :, None] == ms_note_ids[..., None, :]).any(-1).detach().cpu()
-
-        my_degs = torch.full(note_appeared_yes_mask.shape, torch.nan, dtype=torch.float16, device=device)
-        my_degs[torch.where(note_appeared_global_to_local)[:-1]] = degs[torch.where(note_appeared_local_to_global)[:-1]]
-        my_degs = my_degs.detach().cpu()
+        note_cut_angles = torch.full(note_appeared_mask.shape, torch.nan, dtype=torch.float16, device=device)
+        note_cut_angles[torch.where(note_appeared_global_to_local)[:-1]] = cut_angles[torch.where(note_appeared_local_to_global)[:-1]]
 
         return (
-            note_appeared_yes_mask,
-            bomb_appeared_yes_mask,
-            obstacle_appeared_yes_mask,
-            bomb_collided_yes_mask,
-            head_obstacle_signed_dists,
-            gc_yes_masks,
-            bc_yes_masks,
-            ms_yes_masks,
-            my_degs,
+            note_appeared_mask,
+            bomb_appeared_mask,
+            bomb_collided_mask,
+            head_obstacle_signed_distances,
+            good_cut_mask,
+            bad_cut_mask,
+            note_cut_angles.detach().cpu(),
         )
-
-    @staticmethod
-    def get_saber_verts_and_normals_and_quats(my_3p_traj: torch.Tensor):
-        n_songs, n_cands, n_frames, *rest = my_3p_traj.shape
-        my_3p_traj = my_3p_traj.reshape((n_songs, n_cands, n_frames, 3, 9))
-        my_3p_xyz, my_3p_sixd = (
-            my_3p_traj[..., :3] * 1,
-            my_3p_traj[..., 3:] * 1,
-        )
-        my_3p_quat = sixd_to_quat(my_3p_sixd)
-        my_3p_xyz, my_3p_quat = unity_to_zup(my_3p_xyz, my_3p_quat)
-
-        saber_collider_mesh = pv.Cube(x_length=1.2, y_length=0.2, z_length=0.2)
-        saber_collider_verts = torch.tensor(saber_collider_mesh.points, dtype=torch.float, device=device)
-        saber_collider_verts_across_time = saber_collider_verts[None, None, None, None].repeat(n_songs, n_cands, n_frames, 2, 1, 1)
-        saber_quats = my_3p_quat[..., 1:, :]
-        saber_xyzs = my_3p_xyz[..., 1:, :]
-
-        saber_collider_verts_across_time += torch.tensor([0.5, 0, 0], dtype=torch.float, device=device)[None, None, None, None]
-        saber_collider_verts_across_time = quat_rotate(
-            saber_quats[..., None, :].repeat_interleave(8, -2),
-            saber_collider_verts_across_time,
-        )
-        saber_collider_verts_across_time += saber_xyzs[..., None, :]
-
-        saber_collider_normals = torch.tensor(saber_collider_mesh.face_normals, dtype=torch.float, device=device)
-        saber_collider_normals_across_time = saber_collider_normals[None, None, None, None].repeat(n_songs, n_cands, n_frames, 2, 1, 1)
-        saber_collider_normals_across_time = quat_rotate(
-            saber_quats[..., None, :].repeat_interleave(6, -2),
-            saber_collider_normals_across_time,
-        )
-
-        return (
-            saber_collider_verts_across_time,
-            saber_collider_normals_across_time,
-            saber_quats,
-        )
-
-    @staticmethod
-    def get_3p_verts_and_normals(my_3p_traj: torch.Tensor):
-        n_songs, n_cands, n_frames, *rest = my_3p_traj.shape
-        collider_mesh = pv.Cube(x_length=0.75, y_length=0.75, z_length=0.75)
-        collider_verts = torch.tensor(collider_mesh.points, dtype=torch.float, device=device)
-        collider_verts_across_time = collider_verts[None, None, None, None].repeat(n_songs, n_cands, n_frames, 3, 1, 1)
-        my_3p_xyz, my_3p_sixd = (
-            my_3p_traj[..., :3] * 1,
-            my_3p_traj[..., 3:] * 1,
-        )
-        my_3p_quat = sixd_to_quat(my_3p_sixd)
-        my_3p_xyz, my_3p_quat = unity_to_zup(my_3p_xyz, my_3p_quat)
-        collider_verts_across_time += my_3p_xyz[..., None, :]
-        collider_mesh_normals = torch.tensor(collider_mesh.face_normals, dtype=torch.float, device=device)
-        collider_normals_across_time = collider_mesh_normals[None, None, None, None].repeat(n_songs, n_cands, n_frames, 3, 1, 1)
-
-        return collider_verts_across_time, collider_normals_across_time

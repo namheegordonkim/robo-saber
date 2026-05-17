@@ -1,17 +1,13 @@
 """Extended Reality Open Recording (XROR)."""
 
-import numpy as np
-import fpzip
-import bson
 import datetime
+from copy import deepcopy
+import bson
+import fpzip
+import numpy as np
+
 from .Bsor import make_bsor
 from .tilt import Tilt
-from copy import deepcopy
-
-
-def handler(sig):
-    print("Segfault")
-    return
 
 
 class XROR:
@@ -483,13 +479,10 @@ class XROR:
         """
         xror = XROR()
         data = bson.decode(file)
-        # print(data["info"])
 
         if "timestamp" in data["info"]:
             data["info"]["timestamp"] = int(data["info"]["timestamp"].replace(tzinfo=datetime.timezone.utc).timestamp())
 
-        # signal(SIGSEGV, handler)
-        # signal(SIGFPE, handler)
         floats = fpzip.decompress(data["frames"])
         data["frames"] = floats[0][0].tolist()
 
@@ -871,9 +864,5 @@ class XROR:
             xror.addEventType(id="f", name="FPS", attr=["fps"])
             for frame in bsor.frames:
                 xror.addEvent("f", frame.time, [frame.fps])
-
-        # todo: bomb misses
-        # todo: wall misses
-        # todo: more user data
 
         return xror

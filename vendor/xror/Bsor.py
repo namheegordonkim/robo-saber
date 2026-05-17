@@ -502,17 +502,3 @@ def make_bsor(f: typing.BinaryIO) -> Bsor:
     m.pauses = make_pauses(f)
 
     return m
-
-
-if __name__ == '__main__':
-    import os
-
-    filename = 'D:/_TMP/Burst.bsor'
-    print('File name :    ', os.path.basename(filename))
-    try:
-        with open(filename, "rb") as f:
-            m = make_bsor(f)
-            print('BSOR Version: %d' % m.file_version)
-            print('BSOR notes: %d' % len(m.notes))
-    except BSException as e:
-        raise

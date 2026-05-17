@@ -1,195 +1,119 @@
 import numpy as np
 import torch
 
-from beaty_common.bsmg_xror_utils import open_beatmap_from_unpacked_xror, load_cbo_and_3p, device, get_cbo_np
-from beaty_common.data_utils import SegmentSampler
+from beaty_common.bsmg_xror_utils import device, get_cbo_np
+from beaty_common.data_utils import sample_for_evaluation
 from beaty_common.train_utils import nanpad_collate_fn
 from vendor.torch_saber import TorchSaber
 
+EVALUATION_SEGMENT_LENGTH = 72
+EVALUATION_SAMPLE_COUNT = 1
+EVALUATION_MINIBATCH_SIZE = 512
+EVALUATION_SEGMENT_STRIDE = 1
+EVALUATION_LOOKAHEAD_SECONDS = 4.0
+EVALUATION_PURVIEW_NOTES = 80
+EVALUATION_FLOOR_TIME = -0.5
+SIMULATION_BATCH_SIZE = 1024
+PLAYER_HEIGHT = 1.5044
 
-def evaluate_3p_on_map(_3p, difficulty, characteristic, beatmap, map_info, song_duration, left_handed=False):
-    segment_sampler = SegmentSampler()
+
+def evaluate_3p_on_map(trajectory_3p, difficulty, characteristic, beatmap, map_info, song_duration, left_handed=False):
     notes_np, bombs_np, obstacles_np = get_cbo_np(beatmap, map_info)
-    # song_duration = notes_np[:, 0].max()
     timestamps = np.arange(0, song_duration, 1 / 60)
-    d = {
-        "notes_np": notes_np,
-        "bombs_np": bombs_np,
-        "obstacles_np": obstacles_np,
-        "timestamps": timestamps,
+    min_length = min(trajectory_3p.shape[2], timestamps.shape[0])
+    timestamps = timestamps[:min_length]
+    trajectory_3p = trajectory_3p[:, :, :min_length]
+    collated = nanpad_collate_fn(
+        [[{
+            "notes_np": notes_np,
+            "bombs_np": bombs_np,
+            "obstacles_np": obstacles_np,
+            "timestamps": timestamps,
+        }]]
+    )
+    collated = {
+        name: value.to(device=device) if isinstance(value, torch.Tensor) else value
+        for name, value in collated.items()
     }
-    d = nanpad_collate_fn([[d]])
-    length = d["timestamps"].shape[1]
-    for k, v in d.items():
-        if isinstance(v, torch.Tensor):
-            d[k] = v.to(device=device)
-    game_segments = segment_sampler.sample_for_evaluation(
-        d["notes_np"],
-        d["bombs_np"],
-        d["obstacles_np"],
-        d["timestamps"],
-        d["lengths"],
-        length,
-        1,
-        512,
-        1,
-        4.0,
-        80,
-        -0.5,
+    sampled_map = sample_for_evaluation(
+        collated["notes_np"],
+        collated["bombs_np"],
+        collated["obstacles_np"],
+        collated["timestamps"],
+        collated["lengths"],
+        collated["timestamps"].shape[1],
+        EVALUATION_SAMPLE_COUNT,
+        EVALUATION_MINIBATCH_SIZE,
+        EVALUATION_SEGMENT_STRIDE,
+        EVALUATION_LOOKAHEAD_SECONDS,
+        EVALUATION_PURVIEW_NOTES,
+        EVALUATION_FLOOR_TIME,
     )
-    # Get NJS
-    njs = get_njs(map_info, difficulty, characteristic)
-    note_alive_mask = torch.where(torch.isnan(d["notes_np"][..., 0]), torch.as_tensor(False), torch.as_tensor(True))[..., None, :]
+    note_jump_speed = get_njs(map_info, difficulty, characteristic)
+
     (
-        note_appeared_yes_mask,
-        bomb_appeared_yes_mask,
-        obstacle_appeared_mask,
-        bomb_collided_yes_mask,
-        obstacle_collided_yes_mask,
-        gc_mask,
-        bc_mask,
-        ms_mask,
-        offset_vels,
+        note_appeared_mask,
+        bomb_appeared_mask,
+        bomb_collided_mask,
+        head_obstacle_signed_distances,
+        good_cut_mask,
+        bad_cut_mask,
+        cut_angles,
     ) = TorchSaber.simulate(
-        _3p[:, :, [0]],
-        _3p,
-        game_segments.notes[:, None],
-        game_segments.bombs[:, None],
-        game_segments.obstacles[:, None],
-        game_segments.note_ids[:, None],
-        game_segments.bomb_ids[:, None],
-        game_segments.obstacle_ids[:, None],
-        d["notes_np"],
-        d["bombs_np"],
-        d["obstacles_np"],
-        1.5044,
-        njs,
-        1024,
+        trajectory_3p[:, :, [0]],
+        trajectory_3p,
+        sampled_map.notes[:, None],
+        sampled_map.bombs[:, None],
+        sampled_map.obstacles[:, None],
+        sampled_map.note_ids[:, None],
+        sampled_map.bomb_ids[:, None],
+        sampled_map.obstacle_ids[:, None],
+        collated["notes_np"],
+        collated["bombs_np"],
+        collated["obstacles_np"],
+        PLAYER_HEIGHT,
+        note_jump_speed,
+        SIMULATION_BATCH_SIZE,
     )
+    note_alive_mask = torch.where(
+        torch.isnan(collated["notes_np"][..., 0]),
+        torch.as_tensor(False),
+        torch.as_tensor(True),
+    )[..., None, :]
     (
-        ts,
+        normalized_score,
         n_opportunities,
         n_hits,
         n_misses,
         n_goods,
-        collided_note_masks,
+        collided_note_mask,
         bomb_penalty,
         obstacle_penalty,
-        scores_at_collisions,
-        final_good_yes,
     ) = TorchSaber.evaluate(
         note_alive_mask.to(device),
-        note_appeared_yes_mask.to(device),
-        bomb_appeared_yes_mask.to(device),
-        bomb_collided_yes_mask.to(device),
-        obstacle_collided_yes_mask.to(device),
-        gc_mask.to(device),
-        bc_mask.to(device),
-        offset_vels.to(device),
-        batch_size=1024,
+        note_appeared_mask.to(device),
+        bomb_appeared_mask.to(device),
+        bomb_collided_mask.to(device),
+        head_obstacle_signed_distances.to(device),
+        good_cut_mask.to(device),
+        bad_cut_mask.to(device),
+        cut_angles.to(device),
+        batch_size=SIMULATION_BATCH_SIZE,
     )
-    return ts, n_opportunities, n_goods, n_hits, n_misses
+    return normalized_score, n_opportunities, n_goods, n_hits, n_misses
 
 
 def get_njs(map_info, difficulty, characteristic):
     found = False
     njs = 18
-    for dbs in map_info["_difficultyBeatmapSets"]:
-        if dbs["_beatmapCharacteristicName"] == characteristic:
-            for db in dbs["_difficultyBeatmaps"]:
-                if db["_difficulty"] == difficulty:
+    for difficulty_beatmap_set in map_info["_difficultyBeatmapSets"]:
+        if difficulty_beatmap_set["_beatmapCharacteristicName"] == characteristic:
+            for difficulty_beatmap in difficulty_beatmap_set["_difficultyBeatmaps"]:
+                if difficulty_beatmap["_difficulty"] == difficulty:
                     found = True
-                    njs = db["_noteJumpMovementSpeed"]
+                    njs = difficulty_beatmap["_noteJumpMovementSpeed"]
                     break
     assert found
     if njs == 0:
         njs = map_info["_beatsPerMinute"] / 10
     return njs
-
-
-def evaluate_xror_on_map(xror_unpacked, beatmap, map_info, left_handed=False, njs_offset=0.0):
-    segment_sampler = SegmentSampler()
-    difficulty = xror_unpacked.data["info"]["software"]["activity"]["difficulty"]
-    characteristic = xror_unpacked.data["info"]["software"]["activity"]["mode"]
-    d = load_cbo_and_3p(xror_unpacked, beatmap, map_info, left_handed=left_handed, rescale_yes=True)
-    found = False
-    njs = get_njs(map_info, difficulty, characteristic) + njs_offset
-    d = nanpad_collate_fn([[d]])
-    length = d["timestamps"].shape[1]
-    # length = n_frames
-    for k, v in d.items():
-        if isinstance(v, torch.Tensor):
-            d[k] = v.to(device=device)
-    # d["lengths"][:] = n_frames # cap it at here
-    # d["gt_3p_np"] = d["gt_3p_np"][:, :n_frames]
-    game_segments = segment_sampler.sample_for_evaluation(
-        d["notes_np"],
-        d["bombs_np"],
-        d["obstacles_np"],
-        d["timestamps"],
-        d["lengths"],
-        length,
-        1,
-        512,
-        1,
-        10.0,
-        200,
-        -0.1,
-    )
-    gt_3p_np = d["gt_3p_np"]
-    gt_3p_np = gt_3p_np.reshape((*gt_3p_np.shape[:-1], 3, -1))
-    # height = torch.nanmedian(gt_3p_np[:, -1000:, 0, 1]).item()
-    # height = np.nanmedian(np.array(xror_unpacked.data['events'][5]['floatData'])[:, -1]).item()
-    note_alive_mask = torch.where(torch.isnan(d["notes_np"][..., 0]), torch.as_tensor(False), torch.as_tensor(True))[..., None, :]
-    # njs = x["njs"]
-    # njs = 10
-    n_notes = d["notes_np"].shape[1]
-    # print(f"{n_notes=}")
-    (
-        note_appeared_yes_mask,
-        bomb_appeared_yes_mask,
-        obstacle_appeared_mask,
-        bomb_collided_yes_mask,
-        obstacle_collided_yes_mask,
-        gc_mask,
-        bc_mask,
-        ms_mask,
-        offset_vels,
-    ) = TorchSaber.simulate(
-        gt_3p_np[:, None, [0]],
-        gt_3p_np[:, None],
-        game_segments.notes[:, None],
-        game_segments.bombs[:, None],
-        game_segments.obstacles[:, None],
-        game_segments.note_ids[:, None],
-        game_segments.bomb_ids[:, None],
-        game_segments.obstacle_ids[:, None],
-        d["notes_np"],
-        d["bombs_np"],
-        d["obstacles_np"],
-        1.5044,
-        njs,
-        512,
-    )
-    (
-        ts,
-        n_opportunities,
-        n_hits,
-        n_misses,
-        n_goods,
-        collided_note_masks,
-        bomb_penalty,
-        obstacle_penalty,
-        scores_at_collisions,
-        final_good_yes,
-    ) = TorchSaber.evaluate(
-        note_alive_mask.to(device),
-        bomb_appeared_yes_mask.to(device),
-        bomb_collided_yes_mask.to(device),
-        obstacle_collided_yes_mask.to(device),
-        gc_mask.to(device),
-        bc_mask.to(device),
-        offset_vels.to(device),
-        batch_size=1024,
-    )
-    return ts, n_opportunities, n_goods, n_hits, n_misses

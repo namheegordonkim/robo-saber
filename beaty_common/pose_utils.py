@@ -5,11 +5,11 @@ from scipy.spatial.transform import Rotation
 
 def sixd_to_quat(sixd: np.ndarray or torch.Tensor) -> np.ndarray or torch.Tensor:
     if isinstance(sixd, torch.Tensor):
-        _sixd = sixd.detach().cpu().numpy()
+        sixd_array = sixd.detach().cpu().numpy()
     else:
-        _sixd = sixd * 1
-    _sixd = _sixd.reshape((*_sixd.shape[:-1], 2, 3)).swapaxes(-2, -1)
-    m = np.concatenate([_sixd, np.cross(_sixd[..., 0], _sixd[..., 1], axis=-1)[..., None]], axis=-1)
+        sixd_array = sixd * 1
+    sixd_array = sixd_array.reshape((*sixd_array.shape[:-1], 2, 3)).swapaxes(-2, -1)
+    m = np.concatenate([sixd_array, np.cross(sixd_array[..., 0], sixd_array[..., 1], axis=-1)[..., None]], axis=-1)
     r = Rotation.from_matrix(m.reshape((-1, 3, 3)))
     quat = r.as_quat().reshape(*sixd.shape[:-1], 4)
     if isinstance(sixd, torch.Tensor):
@@ -50,22 +50,17 @@ def slerp(q0, q1, t):
 
 
 def interpolate_xyzsixd(keypoints, stride):
-    # (n_songs, n_cands, n_frames, ...)
-    # use n_frames as n_keypoints
     device = keypoints.device
     if keypoints.shape[2] == 1:
         return keypoints[:, :, :, None].repeat_interleave(stride, -3)
-    # Lerp
     lefts = keypoints[:, :, :-1]
     rights = keypoints[:, :, 1:]
     lefts = lefts.reshape((lefts.shape[0], lefts.shape[1], lefts.shape[2], 3, -1))
     rights = rights.reshape((rights.shape[0], rights.shape[1], rights.shape[2], 3, -1))
     left_xyz = lefts[..., :3]
     right_xyz = rights[..., :3]
-    # slopes = (right_xyz - left_xyz)
     lerp_t = torch.linspace(0, 1, stride + 1, device=device)[1:]
     interpolated_xyz = left_xyz[:, :, :, None] * (1 - lerp_t[None, None, None, :, None, None]) + right_xyz[:, :, :, None] * lerp_t[None, None, None, :, None, None]
-    # Slerp
     left_sixd = lefts[..., 3:]
     right_sixd = rights[..., 3:]
     left_quat = sixd_to_quat(left_sixd)

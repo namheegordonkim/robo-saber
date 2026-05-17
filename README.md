@@ -14,58 +14,59 @@ Official codebase for Robo-Saber (Eurographics 2026)
 
 ## Dependencies
 
-* [uv](https://docs.astral.sh/uv/): optional but recommended
+* [uv](https://docs.astral.sh/uv/)
+* Internet access on the first run so `prepare.py` can fetch the model bundle and manifests, and `generate.py` can fetch missing BeatSaver maps and replay tarballs
 
 ## Installation
 
-### With `snakemake` + `uv` (Recommended)
+```bash
+uv sync
+```
+
+This creates a local `.venv` with Python 3.11 and installs the repo from `pyproject.toml`.
+
+## Prepare assets
 
 ```bash
 uv run snakemake prepare
 ```
 
-This downloads the pretrained model snapshot and post-QC manifest for BOXRR-23.
+This downloads:
 
-### Without `uv`
-
-#### 1. Create a `venv`, `conda` environment, or similar virtual environment to your liking. The codebase is tested on Python 3.11.
-
-Install the requirements
-
-```bash
-pip install -r requirements.txt
-```
-
-#### 2. Download the pretrained model snapshot
-
-#### 3. Download the post-QC manifest for BOXRR-23
-
-### `conda`
-
-### `venv`
-
-### `pip`
+* `models/pretrained.pkl`
+* `data/boxrr23_post_qc.csv`
+* `data/heldout_player_maps.csv`
+* `data/placeholder_3p.txt`
+* `data/placeholder_3p_sixd.txt`
 
 ## Running the code
 
-### With `snakemake` + `uv` (Recommended)
-
-This works best for testing the code out of the box.
+Recommended:
 
 ```bash
 uv run snakemake generate
 ```
 
-### With `uv`
+This writes `out/gen3p.nc`.
 
-You can supply custom CLI arguments using
-
-```bash
-uv run robo-saber/generate.py --csv_path [csv_path]...
-```
-
-### Without `uv`
+To override the default Snakemake inputs from `config.yaml`:
 
 ```bash
-python 
+uv run snakemake generate --config csv_path='data/your_inputs.csv' target_player_source=csv
 ```
+
+Direct script usage:
+
+```bash
+uv run robo-saber/generate.py \
+  --csv_path data/heldout_player_maps.csv \
+  --target_player_source csv
+```
+
+`snakemake generate` uses the same defaults from `config.yaml`.
+
+## Notes
+
+* Run commands from the repository root.
+* `generate.py` currently assumes CUDA. Run inference on a machine with an NVIDIA GPU and a working CUDA-enabled PyTorch install.
+* `config.yaml` controls the default `snakemake generate` inputs.

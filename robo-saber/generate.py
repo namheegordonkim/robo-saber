@@ -10,293 +10,425 @@ import requests
 import torch
 import xarray as xr
 from tqdm import tqdm
+
 from beaty_common.bsmg_xror_utils import get_cbo_np, load_cbo_and_3p, open_beatmap_from_bsmg_or_boxrr
-from beaty_common.data_utils import SegmentSampler, device as eval_device
+from beaty_common.data_utils import device as eval_device, sample_for_training
 from beaty_common.eval_utils import evaluate_3p_on_map
 from beaty_common.gen_utils import generate_3p_from_style_embeddings
+from beaty_common.torch_nets import CondTransformerGSVAE, GameplayEncoder, ReplayTensors, SentinelPredictor, TransformerGSVAE
 from beaty_common.train_utils import nanpad_collate_fn
-from beaty_common.torch_nets2 import CondTransformerGSVAE, GameplayEncoder, SentinelPredictor, TransformerGSVAE
 from vendor.xror.xror import XROR
 
-device = torch.device("cuda")
-user_tar_cache = {}
-
+MODEL_DEVICE = torch.device("cuda")
+PLAYER_HEIGHT = 1.5044
+BEATSAVER_DIR = "data/BeatSaver"
+STANDARD_CHARACTERISTIC = "Standard"
 DEFAULT_CLEAN_SNAPSHOT_PATH = os.path.normpath("models/pretrained.pkl")
+MAX_OUTPUT_ROWS = 10
+STRONG_PLAYER_QUANTILE = 0.99
+REFERENCE_REPLAYS_PER_REQUEST = 5
+REFERENCE_SEGMENT_LENGTH = 72
+REFERENCE_SEGMENT_COUNT = 1
+REFERENCE_SEGMENT_MINIBATCH = 2048
+REFERENCE_SEGMENT_STRIDE = 4
+REFERENCE_LOOKAHEAD_SECONDS = 2.0
+REFERENCE_PURVIEW_NOTES = 20
+REFERENCE_FLOOR_TIME = -0.1
+REFERENCE_HISTORY_FRAMES = 2
+CLASSIFIER_SEGMENT_LENGTH = 72
+CLASSIFIER_SEGMENT_COUNT = 36
+CLASSIFIER_SEGMENT_MINIBATCH = 512
+CLASSIFIER_SEGMENT_STRIDE = 4
+CLASSIFIER_LOOKAHEAD_SECONDS = 2.0
+CLASSIFIER_PURVIEW_NOTES = 20
+CLASSIFIER_FLOOR_TIME = -0.1
+DIFFICULTY_NAME_BY_CODE = {
+    1: "Easy",
+    3: "Normal",
+    5: "Hard",
+    7: "Expert",
+    9: "ExpertPlus",
+}
+
+player_tar_cache = {}
 
 
 def load_models(bundle_path):
-    """Load the four nets from a single ``torch.save`` bundle (ctor kwargs + ``state_dict`` tensors)."""
     bundle = torch.load(bundle_path, map_location="cpu", weights_only=False)
 
-    pred_net = CondTransformerGSVAE(**bundle["pred_kw"])
-    pred_net.load_state_dict(bundle["pred_sd"], strict=True)
-    pred_net = pred_net.to(device).eval().requires_grad_(False)
+    style_predictor = CondTransformerGSVAE(**bundle["pred_kw"])
+    style_predictor.load_state_dict(bundle["pred_sd"], strict=True)
+    style_predictor = style_predictor.to(MODEL_DEVICE).eval().requires_grad_(False)
 
-    gsvae_net = TransformerGSVAE(**bundle["gsvae_kw"])
-    gsvae_net.load_state_dict(bundle["gsvae_sd"], strict=True)
-    gsvae_net = gsvae_net.to(device).eval().requires_grad_(False)
+    trajectory_decoder = TransformerGSVAE(**bundle["gsvae_kw"])
+    trajectory_decoder.load_state_dict(bundle["gsvae_sd"], strict=True)
+    trajectory_decoder = trajectory_decoder.to(MODEL_DEVICE).eval().requires_grad_(False)
 
-    classy_enc_ema = GameplayEncoder(**bundle["classy_enc_kw"])
-    classy_enc_ema.load_state_dict(bundle["classy_enc_sd"], strict=True)
-    classy_enc_ema = classy_enc_ema.to(eval_device).eval().requires_grad_(False)
+    player_encoder = GameplayEncoder(**bundle["classy_enc_kw"])
+    player_encoder.load_state_dict(bundle["classy_enc_sd"], strict=True)
+    player_encoder = player_encoder.to(eval_device).eval().requires_grad_(False)
 
-    classy_head_ema = SentinelPredictor(**bundle["classy_head_kw"])
-    classy_head_ema.load_state_dict(bundle["classy_head_sd"], strict=True)
-    classy_head_ema = classy_head_ema.to(eval_device).eval().requires_grad_(False)
+    player_classifier = SentinelPredictor(**bundle["classy_head_kw"])
+    player_classifier.load_state_dict(bundle["classy_head_sd"], strict=True)
+    player_classifier = player_classifier.to(eval_device).eval().requires_grad_(False)
 
     return {
-        "pred_net": pred_net,
-        "gsvae_net": gsvae_net,
-        "classy_enc_ema": classy_enc_ema,
-        "classy_head_ema": classy_head_ema,
+        "style_predictor": style_predictor,
+        "trajectory_decoder": trajectory_decoder,
+        "player_encoder": player_encoder,
+        "player_classifier": player_classifier,
         "chunk_length": int(bundle["chunk_length"]),
-        "history_len": int(bundle["history_len"]),
+        "history_length": int(bundle["history_len"]),
     }
 
 
-def load_data(args):
+def load_request_rows(args):
     boxrr23_manifest = pd.read_csv(args.boxrr23_manifest_path)
     boxrr23_manifest["User ID"] = boxrr23_manifest["User ID"].astype(str)
 
-    df = pd.concat([pd.read_csv(filename) for filename in tqdm(sorted(glob.glob(args.csv_path, recursive=True)))])
-    if "User ID" in df.columns:
-        df["User ID"] = df["User ID"].astype(str)
-    join_cols = [col for col in df.columns if col in boxrr23_manifest.columns]
-    if len(join_cols) == 0:
+    request_rows = pd.concat([pd.read_csv(path) for path in tqdm(sorted(glob.glob(args.csv_path, recursive=True)))])
+    if "User ID" in request_rows.columns:
+        request_rows["User ID"] = request_rows["User ID"].astype(str)
+
+    join_columns = [column for column in request_rows.columns if column in boxrr23_manifest.columns]
+    if len(join_columns) == 0:
         raise ValueError(f"No shared columns between {args.csv_path} and {args.boxrr23_manifest_path}")
-    df = df.merge(boxrr23_manifest.drop_duplicates(subset=join_cols), on=join_cols, how="left")
+    request_rows = request_rows.merge(
+        boxrr23_manifest.drop_duplicates(subset=join_columns),
+        on=join_columns,
+        how="left",
+    )
 
-    means = boxrr23_manifest.groupby("User ID")["Normalized Score"].mean()
-    target_player_ids = means[means >= means.quantile(0.99)].index.tolist()
-    id_to_class_idx = {pid: i for i, pid in enumerate(boxrr23_manifest["User ID"].unique())}
-
-    return df, target_player_ids, id_to_class_idx
+    mean_scores = boxrr23_manifest.groupby("User ID")["Normalized Score"].mean()
+    strong_player_ids = mean_scores[mean_scores >= mean_scores.quantile(STRONG_PLAYER_QUANTILE)].index.tolist()
+    player_id_to_class_index = {player_id: index for index, player_id in enumerate(boxrr23_manifest["User ID"].unique())}
+    return request_rows, strong_player_ids, player_id_to_class_index
 
 
 def generate(models, target_player_id, target_song_hash, target_difficulty):
-    user_tar = user_tar_cache.get(target_player_id)
-    if user_tar is None:
+    player_tar = player_tar_cache.get(target_player_id)
+    if player_tar is None:
         response = requests.get(
             f"https://huggingface.co/datasets/cschell/boxrr-23/resolve/main/users/{target_player_id[0]}/{target_player_id}.tar",
             timeout=300,
         )
         if response.status_code != 200:
-            raise RuntimeError(f"Failed to fetch HF user tar for User ID {target_player_id}: {response.status_code} {response.text}")
-        with tarfile.open(fileobj=io.BytesIO(response.content), mode="r:") as tf:
-            member_names = [member.name for member in tf.getmembers() if member.isfile()]
+            raise RuntimeError(
+                f"Failed to fetch HF user tar for User ID {target_player_id}: {response.status_code} {response.text}"
+            )
+        with tarfile.open(fileobj=io.BytesIO(response.content), mode="r:") as tar_file:
+            member_names = [member.name for member in tar_file.getmembers() if member.isfile()]
         if len(member_names) == 0:
             raise ValueError(f"No replay files found in HF user tar for User ID {target_player_id}")
-        user_tar = {"bytes": response.content, "member_names": member_names}
-        user_tar_cache[target_player_id] = user_tar
+        player_tar = {"bytes": response.content, "member_names": member_names}
+        player_tar_cache[target_player_id] = player_tar
 
-    candidate_member_names = np.random.permutation(user_tar["member_names"])
-    valid_reference_replays = []
-    with tarfile.open(fileobj=io.BytesIO(user_tar["bytes"]), mode="r:") as tf:
-        for member_name in candidate_member_names:
-            member_file = tf.extractfile(str(member_name))
+    reference_replay = None
+    with tarfile.open(fileobj=io.BytesIO(player_tar["bytes"]), mode="r:") as tar_file:
+        for member_name in np.random.permutation(player_tar["member_names"]):
+            member_file = tar_file.extractfile(str(member_name))
             if member_file is None:
                 raise ValueError(f"Failed to read replay {member_name} from HF user tar for User ID {target_player_id}")
-            xror_unpacked = XROR.unpack(member_file.read())
-            fetched_user_id = str(xror_unpacked.data["info"]["user"]["id"])
+
+            unpacked_xror = XROR.unpack(member_file.read())
+            fetched_user_id = str(unpacked_xror.data["info"]["user"]["id"])
             if fetched_user_id != target_player_id:
-                raise ValueError(f"HF user tar mismatch for User ID {target_player_id}: replay {member_name} belongs to {fetched_user_id}")
+                raise ValueError(
+                    f"HF user tar mismatch for User ID {target_player_id}: replay {member_name} belongs to {fetched_user_id}"
+                )
+
             try:
-                activity = xror_unpacked.data["info"]["software"]["activity"]
-                difficulty = activity["difficulty"]
-                if isinstance(difficulty, int):
-                    difficulty = {1: "Easy", 3: "Normal", 5: "Hard", 7: "Expert", 9: "ExpertPlus"}[difficulty]
-                song_hash = str(activity["songHash"]).upper()
-                beatmap_ref, map_info_ref, _ = open_beatmap_from_bsmg_or_boxrr(f"data/BeatSaver/{song_hash}.zip", None, difficulty)
+                activity = unpacked_xror.data["info"]["software"]["activity"]
+                replay_difficulty = activity["difficulty"]
+                if isinstance(replay_difficulty, int):
+                    replay_difficulty = DIFFICULTY_NAME_BY_CODE[replay_difficulty]
+                replay_song_hash = str(activity["songHash"]).upper()
+                beatmap, map_info = open_beatmap_from_bsmg_or_boxrr(
+                    f"{BEATSAVER_DIR}/{replay_song_hash}.zip",
+                    None,
+                    replay_difficulty,
+                )[:2]
                 left_handed = activity.get("leftHanded", False)
-                cbo_and_3p = load_cbo_and_3p(xror_unpacked, beatmap_ref, map_info_ref, left_handed=left_handed, rescale_yes=True)
+                reference_replay = load_cbo_and_3p(
+                    unpacked_xror,
+                    beatmap,
+                    map_info,
+                    left_handed=left_handed,
+                    rescale_yes=True,
+                )
             except (FileNotFoundError, KeyError, ValueError):
                 continue
-            valid_reference_replays.append(cbo_and_3p)
             break
-    if len(valid_reference_replays) == 0:
+
+    if reference_replay is None:
         return None
 
-    sampled_ref_idxs = np.random.choice(len(valid_reference_replays), size=5, replace=True)
-    cbo_and_3p_for_set = [valid_reference_replays[idx] for idx in sampled_ref_idxs]
+    collated = nanpad_collate_fn([[reference_replay for reference_index in range(REFERENCE_REPLAYS_PER_REQUEST)]])
+    collated = {
+        name: value.to(device=MODEL_DEVICE) if isinstance(value, torch.Tensor) else value
+        for name, value in collated.items()
+    }
 
-    d = nanpad_collate_fn([cbo_and_3p_for_set])
-    d = {k: v.to(device=device) if isinstance(v, torch.Tensor) else v for k, v in d.items()}
-    res = []
-    for j in range(d["notes_np"].shape[0]):
-        seen_game_segments, seen_movement_segments = SegmentSampler().sample_for_training(
-            d["notes_np"][[j]], d["bombs_np"][[j]], d["obstacles_np"][[j]],
-            d["timestamps"][[j]], d["gt_3p_np"][[j]], d["lengths"][[j]],
-            72, 1, 2048, 4, 2.0, 20, -0.1,
+    reference_segments = []
+    for reference_index in range(collated["notes_np"].shape[0]):
+        sampled_replay = sample_for_training(
+            collated["notes_np"][[reference_index]],
+            collated["bombs_np"][[reference_index]],
+            collated["obstacles_np"][[reference_index]],
+            collated["timestamps"][[reference_index]],
+            collated["gt_3p_np"][[reference_index]],
+            collated["lengths"][[reference_index]],
+            REFERENCE_SEGMENT_LENGTH,
+            REFERENCE_SEGMENT_COUNT,
+            REFERENCE_SEGMENT_MINIBATCH,
+            REFERENCE_SEGMENT_STRIDE,
+            REFERENCE_LOOKAHEAD_SECONDS,
+            REFERENCE_PURVIEW_NOTES,
+            REFERENCE_FLOOR_TIME,
         )
-        res.append((
-            seen_game_segments.notes[:, 2],
-            seen_game_segments.bombs[:, 2],
-            seen_game_segments.obstacles[:, 2],
-            seen_movement_segments.three_p[:, 2:],
-            seen_movement_segments.three_p[:, :2],
-        ))
-    notes, bombs, obstacles, my_3p, history = (torch.cat(parts, dim=0) for parts in zip(*res))
+        reference_segments.append(
+            (
+                sampled_replay.notes[:, REFERENCE_HISTORY_FRAMES],
+                sampled_replay.bombs[:, REFERENCE_HISTORY_FRAMES],
+                sampled_replay.obstacles[:, REFERENCE_HISTORY_FRAMES],
+                sampled_replay.trajectory[:, REFERENCE_HISTORY_FRAMES:],
+                sampled_replay.trajectory[:, :REFERENCE_HISTORY_FRAMES],
+            )
+        )
 
-    style_embs, style_masks = models["pred_net"].encode_style(
-        notes[None], bombs[None], obstacles[None], history[None], my_3p[None]
+    reference_notes, reference_bombs, reference_obstacles, reference_trajectory, reference_history = (
+        torch.cat(parts, dim=0) for parts in zip(*reference_segments)
     )
-    segment_3p, cand_3p = generate_3p_from_style_embeddings(
-        style_embs, style_masks, target_song_hash, target_difficulty,
-        models["pred_net"], models["gsvae_net"], device,
-        models["chunk_length"], models["history_len"],
+    playstyle_tokens, playstyle_mask = models["style_predictor"].encode_style(
+        ReplayTensors(
+            reference_notes[None],
+            reference_bombs[None],
+            reference_obstacles[None],
+            history=reference_history[None],
+            trajectory=reference_trajectory[None],
+        )
     )
-    return segment_3p.detach().cpu(), cand_3p.detach().cpu()
+    generated_3p, generated_candidates = generate_3p_from_style_embeddings(
+        playstyle_tokens,
+        playstyle_mask,
+        target_song_hash,
+        target_difficulty,
+        models["style_predictor"],
+        models["trajectory_decoder"],
+        MODEL_DEVICE,
+        models["chunk_length"],
+        models["history_length"],
+    )
+    return generated_3p.detach().cpu(), generated_candidates.detach().cpu()
 
 
-def evaluate(models, generated_3p, target_zip_path, target_difficulty, player_cat):
+def evaluate(models, generated_3p, target_zip_path, target_difficulty, player_category):
     try:
         beatmap, map_info, song_duration = open_beatmap_from_bsmg_or_boxrr(target_zip_path, None, target_difficulty)
     except FileNotFoundError:
         return None
 
-    my_3p = generated_3p.to(device=eval_device, dtype=torch.float32)
-
+    generated_3p = generated_3p.to(device=eval_device, dtype=torch.float32)
     notes_np, bombs_np, obstacles_np = get_cbo_np(beatmap, map_info)
     timestamps = np.arange(0, song_duration, 1 / 60)
-    min_len = min(my_3p.shape[2], timestamps.shape[0])
-    timestamps = timestamps[:min_len]
-    my_3p = my_3p[:, :, :min_len]
-    d = nanpad_collate_fn([[{
-        "notes_np": notes_np,
-        "bombs_np": bombs_np,
-        "obstacles_np": obstacles_np,
-        "timestamps": timestamps,
-        "3p": my_3p[0, 0].flatten(-2, -1).detach().cpu().numpy(),
-    }]])
-    d = {k: v.to(device=eval_device) if isinstance(v, torch.Tensor) else v for k, v in d.items()}
-    game_segments, movement_segments = SegmentSampler().sample_for_training(
-        d["notes_np"], d["bombs_np"], d["obstacles_np"],
-        d["timestamps"], d["3p"], d["lengths"],
-        72, 36, 512, 4, 2.0, 20, -0.1,
+    min_length = min(generated_3p.shape[2], timestamps.shape[0])
+    timestamps = timestamps[:min_length]
+    generated_3p = generated_3p[:, :, :min_length]
+
+    collated = nanpad_collate_fn(
+        [[{
+            "notes_np": notes_np,
+            "bombs_np": bombs_np,
+            "obstacles_np": obstacles_np,
+            "timestamps": timestamps,
+            "3p": generated_3p[0, 0].flatten(-2, -1).detach().cpu().numpy(),
+        }]]
+    )
+    collated = {
+        name: value.to(device=eval_device) if isinstance(value, torch.Tensor) else value
+        for name, value in collated.items()
+    }
+
+    sampled_replay = sample_for_training(
+        collated["notes_np"],
+        collated["bombs_np"],
+        collated["obstacles_np"],
+        collated["timestamps"],
+        collated["3p"],
+        collated["lengths"],
+        CLASSIFIER_SEGMENT_LENGTH,
+        CLASSIFIER_SEGMENT_COUNT,
+        CLASSIFIER_SEGMENT_MINIBATCH,
+        CLASSIFIER_SEGMENT_STRIDE,
+        CLASSIFIER_LOOKAHEAD_SECONDS,
+        CLASSIFIER_PURVIEW_NOTES,
+        CLASSIFIER_FLOOR_TIME,
     )
     with torch.no_grad():
-        z = models["classy_enc_ema"].forward(
-            game_segments.notes[:, 2].unflatten(0, (-1, 6)),
-            game_segments.bombs[:, 2].unflatten(0, (-1, 6)),
-            game_segments.obstacles[:, 2].unflatten(0, (-1, 6)),
-            movement_segments.three_p[:, :2].unflatten(0, (-1, 6)),
-            movement_segments.three_p[:, 2:].unflatten(0, (-1, 6)),
+        player_embedding = models["player_encoder"].forward(
+            ReplayTensors(
+                sampled_replay.notes[:, REFERENCE_HISTORY_FRAMES].unflatten(0, (-1, 6)),
+                sampled_replay.bombs[:, REFERENCE_HISTORY_FRAMES].unflatten(0, (-1, 6)),
+                sampled_replay.obstacles[:, REFERENCE_HISTORY_FRAMES].unflatten(0, (-1, 6)),
+                history=sampled_replay.trajectory[:, :REFERENCE_HISTORY_FRAMES].unflatten(0, (-1, 6)),
+                trajectory=sampled_replay.trajectory[:, REFERENCE_HISTORY_FRAMES:].unflatten(0, (-1, 6)),
+            )
         )
-        logits = models["classy_head_ema"].forward(z)
-        cross_entropy_loss = torch.nn.functional.cross_entropy(logits, player_cat.repeat_interleave(6), reduction="none")
+        classifier_logits = models["player_classifier"].forward(player_embedding)
+        cross_entropy = torch.nn.functional.cross_entropy(
+            classifier_logits,
+            player_category.repeat_interleave(6),
+            reduction="none",
+        )
 
-    ts, n_opportunities, n_goods, n_hits, n_misses = (
-        t.item() for t in evaluate_3p_on_map(my_3p, target_difficulty, "Standard", beatmap, map_info, song_duration)
+    normalized_score, n_opportunities, n_goods, n_hits, n_misses = (
+        value.item()
+        for value in evaluate_3p_on_map(
+            generated_3p,
+            target_difficulty,
+            STANDARD_CHARACTERISTIC,
+            beatmap,
+            map_info,
+            song_duration,
+        )
     )
-
     return {
-        "TS": ts,
+        "TS": normalized_score,
         "n_opportunities": n_opportunities,
         "n_hits": n_hits,
         "n_misses": n_misses,
         "n_goods": n_goods,
         "PR_GC": n_goods / n_opportunities,
-        "CE": cross_entropy_loss.mean().item(),
+        "CE": cross_entropy.mean().item(),
         **{
-            f"Top-{k} Accuracy": (logits.topk(k, dim=-1).indices == player_cat[:, None]).any(dim=-1).float().mean().item()
+            f"Top-{k} Accuracy": (
+                classifier_logits.topk(k, dim=-1).indices == player_category[:, None]
+            ).any(dim=-1).float().mean().item()
             for k in (1, 10, 100, 1000)
         },
     }
 
 
-def write_record(nc_out_path, outputs_written, generated_3p, generated_cands, metrics,
-                 target_song_hash, target_difficulty, target_player_id, csv_i):
-    three_p_arr = generated_3p.numpy()
-    cands_arr = generated_cands.numpy()
-    three_p_dims = tuple(f"three_p_dim_{j}" for j in range(three_p_arr.ndim))
-    cands_dims = tuple(f"cands_dim_{j}" for j in range(cands_arr.ndim))
-    ds = xr.Dataset(
+def write_record(
+    nc_out_path,
+    outputs_written,
+    generated_3p,
+    generated_candidates,
+    metrics,
+    target_song_hash,
+    target_difficulty,
+    target_player_id,
+    request_index,
+):
+    three_p_array = generated_3p.numpy()
+    candidate_array = generated_candidates.numpy()
+    three_p_dims = tuple(f"three_p_dim_{dim_index}" for dim_index in range(three_p_array.ndim))
+    candidate_dims = tuple(f"cands_dim_{dim_index}" for dim_index in range(candidate_array.ndim))
+    dataset = xr.Dataset(
         {
-            "3p": (three_p_dims, three_p_arr),
-            "cands": (cands_dims, cands_arr),
+            "3p": (three_p_dims, three_p_array),
+            "cands": (candidate_dims, candidate_array),
             **metrics,
         },
         attrs={
             "Song Hash": target_song_hash,
             "Difficulty Level": target_difficulty,
             "User ID": target_player_id,
-            "seed": int(csv_i),
+            "seed": int(request_index),
         },
     )
-    mode = "w" if outputs_written == 0 else "a"
-    ds.to_netcdf(nc_out_path, mode=mode, group=str(outputs_written), engine="h5netcdf")
+    dataset.to_netcdf(
+        nc_out_path,
+        mode="w" if outputs_written == 0 else "a",
+        group=str(outputs_written),
+        engine="h5netcdf",
+    )
 
 
-def main(args, remaining_args):
-    outdir = "out"
-    os.makedirs(outdir, exist_ok=True)
-    nc_out_path = args.nc_out_path
-    nc_parent = os.path.dirname(os.path.abspath(nc_out_path))
-    if nc_parent:
-        os.makedirs(nc_parent, exist_ok=True)
+def main(args):
+    os.makedirs("out", exist_ok=True)
+    output_path = args.nc_out_path
+    output_parent = os.path.dirname(os.path.abspath(output_path))
+    if output_parent:
+        os.makedirs(output_parent, exist_ok=True)
 
-    bundle_path = args.clean_models_bundle
-    models = load_models(bundle_path)
-    print(f"Loaded models from inference snapshot {bundle_path!r}")
+    models = load_models(args.clean_models_bundle)
+    print(f"Loaded models from inference snapshot {args.clean_models_bundle!r}")
     print("Loading manifest...")
-    df, target_player_ids, id_to_class_idx = load_data(args)
+    request_rows, strong_player_ids, player_id_to_class_index = load_request_rows(args)
 
-    os.makedirs("data/BeatSaver", exist_ok=True)
-    n_outputs = min(10, len(df))
+    os.makedirs(BEATSAVER_DIR, exist_ok=True)
+    n_outputs = min(MAX_OUTPUT_ROWS, len(request_rows))
     outputs_written = 0
-    pbar = tqdm(total=n_outputs)
+    progress = tqdm(total=n_outputs)
 
-    for i in range(len(df)):
+    for request_index in range(len(request_rows)):
         if outputs_written >= n_outputs:
             break
 
-        np.random.seed(i)
-        torch.manual_seed(i)
-        torch.cuda.manual_seed_all(i)
+        np.random.seed(request_index)
+        torch.manual_seed(request_index)
+        torch.cuda.manual_seed_all(request_index)
 
-        row = df.iloc[i]
-        target_song_hash = str(row["Song Hash"])
-        target_difficulty = str(row["Difficulty Level"])
-        target_zip_path = f"data/BeatSaver/{target_song_hash.upper()}.zip"
+        request_row = request_rows.iloc[request_index]
+        target_song_hash = str(request_row["Song Hash"])
+        target_difficulty = str(request_row["Difficulty Level"])
+        target_zip_path = f"{BEATSAVER_DIR}/{target_song_hash.upper()}.zip"
 
         if args.target_player_source == "csv":
-            if "User ID" not in df.columns:
+            if "User ID" not in request_rows.columns:
                 raise ValueError("target_player_source=csv requires a 'User ID' column in csv_path")
-            raw_target_player_id = row["User ID"]
+            raw_target_player_id = request_row["User ID"]
             if pd.isna(raw_target_player_id):
-                print(f"Skipping csv row {i}: missing User ID for target_player_source=csv")
+                print(f"Skipping csv row {request_index}: missing User ID for target_player_source=csv")
                 continue
             target_player_id = str(raw_target_player_id)
         else:
-            target_player_id = str(np.random.choice(target_player_ids))
+            target_player_id = str(np.random.choice(strong_player_ids))
 
-        if target_player_id not in id_to_class_idx:
-            print(f"Skipping csv row {i}: {target_player_id=} not found in {args.boxrr23_manifest_path}")
+        if target_player_id not in player_id_to_class_index:
+            print(f"Skipping csv row {request_index}: target_player_id={target_player_id!r} not found in {args.boxrr23_manifest_path}")
             continue
 
-        out = generate(models, target_player_id, target_song_hash, target_difficulty)
-        if out is None:
-            print(f"Skipping csv row {i}: found no valid reference replays for {target_player_id=}")
+        generated = generate(models, target_player_id, target_song_hash, target_difficulty)
+        if generated is None:
+            print(f"Skipping csv row {request_index}: found no valid reference replays for target_player_id={target_player_id!r}")
             continue
-        generated_3p, generated_cands = out
+        generated_3p, generated_candidates = generated
 
-        player_cat = torch.as_tensor([id_to_class_idx[target_player_id]], device=eval_device)
-        metrics = evaluate(models, generated_3p, target_zip_path, target_difficulty, player_cat)
+        player_category = torch.as_tensor([player_id_to_class_index[target_player_id]], device=eval_device)
+        metrics = evaluate(models, generated_3p, target_zip_path, target_difficulty, player_category)
         if metrics is None:
-            print(f"Skipping csv row {i}: target map unavailable for {target_song_hash=} {target_difficulty=}")
+            print(
+                f"Skipping csv row {request_index}: target map unavailable for target_song_hash={target_song_hash!r} "
+                f"target_difficulty={target_difficulty!r}"
+            )
             continue
 
-        print(f"{i=} {target_song_hash=} {target_difficulty=} {target_player_id=}")
+        print(
+            f"request_index={request_index} target_song_hash={target_song_hash!r} "
+            f"target_difficulty={target_difficulty!r} target_player_id={target_player_id!r}"
+        )
         print(metrics)
-        write_record(nc_out_path, outputs_written, generated_3p, generated_cands, metrics, target_song_hash, target_difficulty, target_player_id, i)
+        write_record(
+            output_path,
+            outputs_written,
+            generated_3p,
+            generated_candidates,
+            metrics,
+            target_song_hash,
+            target_difficulty,
+            target_player_id,
+            request_index,
+        )
         outputs_written += 1
-        pbar.update(1)
+        progress.update(1)
 
-    pbar.close()
+    progress.close()
     if outputs_written == 0:
         print("No rows were generated.")
         return
-    print(f"Saved to {nc_out_path}")
+    print(f"Saved to {output_path}")
     print("Done")
 
 
@@ -321,5 +453,4 @@ if __name__ == "__main__":
         default="out/gen3p.nc",
         help="NetCDF output path (default: out/gen3p.nc).",
     )
-    args, remaining_args = parser.parse_known_args()
-    main(args, remaining_args)
+    main(parser.parse_known_args()[0])

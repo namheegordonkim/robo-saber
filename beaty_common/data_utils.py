@@ -1,366 +1,231 @@
-from dataclasses import dataclass
-from functools import reduce
-from typing import List
-
-import numpy as np
 import torch
+
+from beaty_common.torch_nets import ReplayTensors
 
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
 
-@dataclass
-class Segment:
+def process_object_bag(
+    object_bags: torch.Tensor,
+    segment_indices: torch.Tensor,
+    segment_timestamps: torch.Tensor,
+    purview_seconds: float,
+    purview_count: int,
+    floor_time: float,
+    use_max_object_count: bool = False,
+    is_obstacle: bool = False,
+):
+    max_object_count = max(object_bags.shape[1], purview_count) if use_max_object_count else object_bags.shape[1]
+    objects_for_segments = object_bags[segment_indices[..., 0]]
 
-    def __post_init__(self):
-        for k, v in self.__dict__.items():
-            assert isinstance(v, torch.Tensor), f"Expected {k} to be a torch.Tensor"
+    if is_obstacle:
+        start_offsets = objects_for_segments[..., 0] - segment_timestamps[..., None]
+        end_offsets = objects_for_segments[..., 0] + objects_for_segments[..., 4] - segment_timestamps[..., None]
+        object_in_purview = torch.logical_and(start_offsets < purview_seconds, end_offsets > floor_time)
+    else:
+        time_offsets = objects_for_segments[..., 0] - segment_timestamps[..., None]
+        object_in_purview = torch.logical_and(floor_time < time_offsets, time_offsets < purview_seconds)
 
-    def __getitem__(self, item):
-        return self.__class__(**{k: v[item] for k, v in self.__dict__.items()})
+    object_indices = torch.arange(max_object_count, dtype=torch.long, device=object_bags.device)[None, None]
+    object_indices = object_indices.repeat_interleave(object_in_purview.shape[0], 0)
+    object_indices = object_indices.repeat_interleave(object_in_purview.shape[1], 1)
+    object_indices += object_in_purview.max(-1)[-1][..., None]
+    object_indices %= max_object_count
+    object_indices = object_indices[..., :purview_count]
 
-    def __mul__(self, other):
-        return self.__class__(**{k: v * other for k, v in self.__dict__.items()})
+    receive_mask = torch.take_along_dim(object_in_purview, object_indices, 2)
+    segment_objects = torch.take_along_dim(objects_for_segments, object_indices[..., None], 2)
+    segment_objects[~receive_mask] = torch.nan
+    segment_objects[..., 0] -= segment_timestamps[..., None]
 
-    def __set__(self, instance, value):
-        for k, v in self.__dict__.items():
-            k[:] = value
-
-    @classmethod
-    def cat(cls, segments: List["Segment"], dim=0):
-        return cls(**{k: torch.cat([getattr(s, k) for s in segments], dim=dim) for k in segments[0].__dict__.keys()})
-
-
-@dataclass
-class GameSegment(Segment):
-    notes: torch.Tensor  # note bag sequence, (B, T, 20, 8) where T is the segment length
-    bombs: torch.Tensor  # bomb bag sequence, (B, T, 20, 5)
-    obstacles: torch.Tensor  # obstacle bag sequence, (B, T, 20, 9)
-    note_ids: torch.Tensor  # note ids in the bag, (B, T, 20)
-    bomb_ids: torch.Tensor  # bomb ids in the bag, (B, T, 20)
-    obstacle_ids: torch.Tensor  # obstacle ids in the bag, (B, T, 20)
-    idxs: torch.Tensor  # song idxs (B, T)
-    frames: torch.Tensor  # frame idxs (B, T)
-
-    def __len__(self):
-        return self.notes.shape[1]
-
-    @property
-    def shape(self):
-        return self.notes.shape[0], self.notes.shape[1]
+    segment_object_ids = object_indices.clone()
+    segment_object_ids[~receive_mask] = -1
+    return segment_objects, segment_object_ids
 
 
-@dataclass
-class MovementSegment(Segment):
-    three_p: torch.Tensor  # 3p sequence, (B, T, 18) or (B, T, 3, 6)
-    idxs: torch.Tensor  # song idxs (B, T)
-    frames: torch.Tensor  # frame idxs (B, T)
+def sample_for_training(
+    notes_np: torch.Tensor,
+    bombs_np: torch.Tensor,
+    obstacles_np: torch.Tensor,
+    timestamps: torch.Tensor,
+    three_p: torch.Tensor,
+    lengths: torch.Tensor,
+    segment_length: int,
+    n_samples: int,
+    minibatch_size: int,
+    stride: int,
+    purview_sec: float,
+    purview_notes: int,
+    floor_time: float,
+    firsts_only: bool = False,
+) -> ReplayTensors:
+    local_device = notes_np.device
+    segment_indices = get_segment_indices(lengths, n_samples, segment_length, stride, firsts_only).to(device=local_device)
 
-    def __len__(self):
-        return self.three_p.shape[1]
+    batch_indices = torch.split(torch.arange(segment_indices.shape[0], device=local_device), minibatch_size)
+    segment_batches = []
+    for batch_index in batch_indices:
+        batch_segment_indices = segment_indices[batch_index]
+        segment_three_p = three_p[batch_segment_indices[..., 0], batch_segment_indices[..., 1]]
+        segment_timestamps = timestamps[batch_segment_indices[..., 0], batch_segment_indices[..., 1]]
 
+        segment_notes, segment_note_ids = process_object_bag(
+            notes_np,
+            batch_segment_indices,
+            segment_timestamps,
+            purview_sec,
+            purview_notes,
+            floor_time,
+        )
+        segment_bombs, segment_bomb_ids = process_object_bag(
+            bombs_np,
+            batch_segment_indices,
+            segment_timestamps,
+            purview_sec,
+            purview_notes,
+            floor_time,
+        )
+        segment_obstacles, segment_obstacle_ids = process_object_bag(
+            obstacles_np,
+            batch_segment_indices,
+            segment_timestamps,
+            purview_sec,
+            purview_notes,
+            floor_time,
+            is_obstacle=True,
+        )
 
-class SegmentSampler:
-
-    def _process_object_bag(
-        self,
-        object_np: torch.Tensor,
-        batch_segment_its: torch.Tensor,
-        segment_timestamps: torch.Tensor,
-        purview_sec: float,
-        purview_notes: int,
-        floor_time: float,
-        use_max_n_notes: bool = False,
-        is_obstacle: bool = False,
-    ):
-        """
-        Helper method to process notes, bombs, or obstacles.
-
-        Args:
-            object_np: The input tensor (notes_np, bombs_np, or obstacles_np)
-            batch_segment_its: Batch segment iteration indices
-            segment_timestamps: Timestamps for segments
-            purview_sec: Time window in seconds
-            purview_notes: Maximum number of objects to include
-            floor_time: Minimum time threshold
-            use_max_n_notes: If True, use max(object_np.shape[1], purview_notes)
-            is_obstacle: If True, use obstacle-specific time delta logic
-
-        Returns:
-            Tuple of (segment_objects, segment_object_ids)
-        """
-        n_notes = max(object_np.shape[1], purview_notes) if use_max_n_notes else object_np.shape[1]
-
-        # Get the bipartite mapping between regular-intervaled timestamps and objects within a map
-        all_note_bags = object_np[batch_segment_its[..., 0]]
-
-        # Calculate time deltas and determine which objects are in purview
-        if is_obstacle:
-            # Obstacles have duration, so check both start and end times
-            time_delta_start = all_note_bags[..., 0] - segment_timestamps[..., None]
-            time_delta_end = (all_note_bags[..., 0] + all_note_bags[..., 4]) - segment_timestamps[..., None]
-            in_purview_yes = torch.logical_and(time_delta_start < purview_sec, time_delta_end > floor_time)
-        else:
-            # Notes and bombs are point events
-            time_deltas = all_note_bags[..., 0] - segment_timestamps[..., None]
-            in_purview_yes = torch.logical_and(floor_time < time_deltas, time_deltas < purview_sec)
-
-        # Populate the "purview" information in object bag
-        # i.e. closest object to the right of the current timestamp should be the first one in the array
-        idxs = torch.arange(n_notes, dtype=torch.long, device=object_np.device)[None, None].repeat_interleave(in_purview_yes.shape[0], 0).repeat_interleave(in_purview_yes.shape[1], 1)
-        idxs += in_purview_yes.max(-1)[-1][..., None]
-        idxs %= n_notes
-        idxs = idxs[..., :purview_notes]
-        right_recv_mask = torch.take_along_dim(in_purview_yes, idxs, 2)
-        segment_objects = torch.take_along_dim(all_note_bags, idxs[..., None], 2)
-        segment_objects[~right_recv_mask] = torch.nan
-        segment_objects[..., 0] -= segment_timestamps[..., None]
-
-        segment_object_ids = idxs * 1
-        segment_object_ids[~right_recv_mask] = -1  # integers don't like nans
-
-        return segment_objects, segment_object_ids
-
-    def sample_for_training(
-        self,
-        notes_np: torch.Tensor,
-        bombs_np: torch.Tensor,
-        obstacles_np: torch.Tensor,
-        timestamps: torch.Tensor,
-        my_pos_expm: torch.Tensor,
-        lengths: torch.Tensor,
-        segment_length: int,
-        n_samples: int,
-        minibatch_size: int,
-        stride: int,
-        purview_sec: float,
-        purview_notes: int,
-        floor_time: float,
-        firsts_only: bool = False,
-    ) -> (GameSegment, MovementSegment):
-        """
-        Produce variable-dim input and output samples based on specified purview in seconds
-        """
-        device = notes_np.device
-        segment_its = get_segment_its(lengths, n_samples, segment_length, stride, firsts_only).to(device=device)
-        # segment_its = get_segment_its_favoring_obstacles(lengths, n_samples, segment_length, obstacles_np[..., 0], timestamps).to(device=device)
-
-        idxs = torch.arange(segment_its.shape[0], device=device)
-        batch_idxs = torch.split(idxs, minibatch_size)
-        batch_reses = []
-        for batch_i in batch_idxs:
-            batch_segment_its = segment_its[batch_i]
-
-            segment_3ps = my_pos_expm[batch_segment_its[..., 0], batch_segment_its[..., 1]]
-            segment_timestamps = timestamps[batch_segment_its[..., 0], batch_segment_its[..., 1]]
-
-            # Process notes
-            segment_notes, segment_note_ids = self._process_object_bag(
-                notes_np,
-                batch_segment_its,
-                segment_timestamps,
-                purview_sec,
-                purview_notes,
-                floor_time,
-                use_max_n_notes=False,
-                is_obstacle=False,
-            )
-
-            # Process bombs
-            segment_bombs, segment_bomb_ids = self._process_object_bag(
-                bombs_np,
-                batch_segment_its,
-                segment_timestamps,
-                purview_sec,
-                purview_notes,
-                floor_time,
-                use_max_n_notes=False,
-                is_obstacle=False,
-            )
-
-            # Process obstacles
-            segment_obstacles, segment_obstacle_ids = self._process_object_bag(
-                obstacles_np,
-                batch_segment_its,
-                segment_timestamps,
-                purview_sec,
-                purview_notes,
-                floor_time,
-                use_max_n_notes=False,
-                is_obstacle=True,
-            )
-
-            batch_reses.append(
-                (
-                    segment_3ps,
-                    segment_notes,
-                    segment_bombs,
-                    segment_obstacles,
-                    segment_note_ids,
-                    segment_bomb_ids,
-                    segment_obstacle_ids,
-                )
-            )
-
-        (
-            segment_3ps,
-            segment_notes,
-            segment_bombs,
-            segment_obstacles,
-            segment_note_ids,
-            segment_bomb_ids,
-            segment_obstacle_ids,
-        ) = list(
-            reduce(
-                lambda acc, res: [torch.cat([a, r], dim=0) for a, r in zip(acc, res)],
-                batch_reses,
+        segment_batches.append(
+            (
+                segment_three_p,
+                segment_notes,
+                segment_bombs,
+                segment_obstacles,
+                segment_note_ids,
+                segment_bomb_ids,
+                segment_obstacle_ids,
             )
         )
 
-        game_segment = GameSegment(
-            notes=segment_notes,
-            bombs=segment_bombs,
-            obstacles=segment_obstacles,
-            note_ids=segment_note_ids,
-            bomb_ids=segment_bomb_ids,
-            obstacle_ids=segment_obstacle_ids,
-            idxs=segment_its[..., 0],
-            frames=segment_its[..., 1],
+    (
+        segment_three_p,
+        segment_notes,
+        segment_bombs,
+        segment_obstacles,
+        segment_note_ids,
+        segment_bomb_ids,
+        segment_obstacle_ids,
+    ) = [torch.cat(parts, dim=0) for parts in zip(*segment_batches)]
+
+    return ReplayTensors(
+        notes=segment_notes,
+        bombs=segment_bombs,
+        obstacles=segment_obstacles,
+        trajectory=segment_three_p,
+        note_ids=segment_note_ids,
+        bomb_ids=segment_bomb_ids,
+        obstacle_ids=segment_obstacle_ids,
+    )
+
+
+def sample_for_evaluation(
+    notes_np: torch.Tensor,
+    bombs_np: torch.Tensor,
+    obstacles_np: torch.Tensor,
+    timestamps: torch.Tensor,
+    lengths: torch.Tensor,
+    segment_length: int,
+    n_samples: int,
+    minibatch_size: int,
+    stride: int,
+    purview_sec: float,
+    purview_notes: int,
+    floor_time: float,
+    firsts_only: bool = False,
+) -> ReplayTensors:
+    local_device = notes_np.device
+    segment_indices = get_segment_indices(lengths, n_samples, segment_length, stride, firsts_only).to(device=local_device)
+
+    batch_indices = torch.split(torch.arange(segment_indices.shape[1], device=local_device), minibatch_size)
+    segment_batches = []
+    for batch_index in batch_indices:
+        batch_segment_indices = segment_indices[:, batch_index]
+        segment_timestamps = timestamps[batch_segment_indices[..., 0], batch_segment_indices[..., 1]]
+
+        segment_notes, segment_note_ids = process_object_bag(
+            notes_np,
+            batch_segment_indices,
+            segment_timestamps,
+            purview_sec,
+            purview_notes,
+            floor_time,
+            use_max_object_count=True,
         )
-        movement_segment = MovementSegment(three_p=segment_3ps, idxs=segment_its[..., 0], frames=segment_its[..., 1])
+        segment_bombs, segment_bomb_ids = process_object_bag(
+            bombs_np,
+            batch_segment_indices,
+            segment_timestamps,
+            purview_sec,
+            purview_notes,
+            floor_time,
+            use_max_object_count=True,
+        )
+        segment_obstacles, segment_obstacle_ids = process_object_bag(
+            obstacles_np,
+            batch_segment_indices,
+            segment_timestamps,
+            purview_sec,
+            purview_notes,
+            floor_time,
+            use_max_object_count=True,
+            is_obstacle=True,
+        )
 
-        return game_segment, movement_segment
-
-    def sample_for_evaluation(
-        self,
-        notes_np: torch.Tensor,
-        bombs_np: torch.Tensor,
-        obstacles_np: torch.Tensor,
-        timestamps: torch.Tensor,
-        lengths: torch.Tensor,
-        segment_length: int,
-        n_samples: int,
-        minibatch_size: int,
-        stride: int,
-        purview_sec: float,
-        purview_notes: int,
-        floor_time: float,
-        firsts_only: bool = False,
-    ) -> GameSegment:
-        """
-        Produce variable-dim input and output samples based on specified purview in seconds
-        """
-        # purview_sec = 2.0
-        # purview_sec = 0.25
-        # purview_notes = 20
-
-        device = notes_np.device
-        segment_its = get_segment_its(lengths, n_samples, segment_length, stride, firsts_only).to(device=device)
-
-        idxs = torch.arange(segment_its.shape[1], device=device)
-        batch_idxs = torch.split(idxs, minibatch_size)
-        batch_reses = []
-        for batch_i in batch_idxs:
-            batch_segment_its = segment_its[:, batch_i]
-
-            segment_timestamps = timestamps[batch_segment_its[..., 0], batch_segment_its[..., 1]]
-
-            # Process notes
-            segment_notes, segment_note_ids = self._process_object_bag(
-                notes_np,
-                batch_segment_its,
-                segment_timestamps,
-                purview_sec,
-                purview_notes,
-                floor_time,
-                use_max_n_notes=True,
-                is_obstacle=False,
-            )
-
-            # Process bombs
-            segment_bombs, segment_bomb_ids = self._process_object_bag(
-                bombs_np,
-                batch_segment_its,
-                segment_timestamps,
-                purview_sec,
-                purview_notes,
-                floor_time,
-                use_max_n_notes=True,
-                is_obstacle=False,
-            )
-
-            # Process obstacles
-            segment_obstacles, segment_obstacle_ids = self._process_object_bag(
-                obstacles_np,
-                batch_segment_its,
-                segment_timestamps,
-                purview_sec,
-                purview_notes,
-                floor_time,
-                use_max_n_notes=True,
-                is_obstacle=True,
-            )
-
-            batch_reses.append(
-                (
-                    segment_notes,
-                    segment_bombs,
-                    segment_obstacles,
-                    segment_note_ids,
-                    segment_bomb_ids,
-                    segment_obstacle_ids,
-                )
-            )
-
-        (
-            segment_notes,
-            segment_bombs,
-            segment_obstacles,
-            segment_note_ids,
-            segment_bomb_ids,
-            segment_obstacle_ids,
-        ) = list(
-            reduce(
-                lambda acc, res: [torch.cat([a, r], dim=1) for a, r in zip(acc, res)],
-                batch_reses,
+        segment_batches.append(
+            (
+                segment_notes,
+                segment_bombs,
+                segment_obstacles,
+                segment_note_ids,
+                segment_bomb_ids,
+                segment_obstacle_ids,
             )
         )
 
-        game_segment = GameSegment(
-            notes=segment_notes,
-            bombs=segment_bombs,
-            obstacles=segment_obstacles,
-            note_ids=segment_note_ids,
-            bomb_ids=segment_bomb_ids,
-            obstacle_ids=segment_obstacle_ids,
-            idxs=segment_its[..., 0],
-            frames=segment_its[..., 1],
-        )
+    (
+        segment_notes,
+        segment_bombs,
+        segment_obstacles,
+        segment_note_ids,
+        segment_bomb_ids,
+        segment_obstacle_ids,
+    ) = [torch.cat(parts, dim=1) for parts in zip(*segment_batches)]
 
-        return game_segment
+    return ReplayTensors(
+        notes=segment_notes,
+        bombs=segment_bombs,
+        obstacles=segment_obstacles,
+        note_ids=segment_note_ids,
+        bomb_ids=segment_bomb_ids,
+        obstacle_ids=segment_obstacle_ids,
+    )
 
 
-def get_segment_its(lengths, n_samples, segment_length, stride, firsts_only):
-    device = lengths.device
-    idxs = (torch.rand(n_samples) * lengths.shape[0]).to(dtype=torch.long, device=device)
-    t_start = (torch.rand(n_samples, device=device) * (lengths[idxs] - segment_length)).to(dtype=torch.long, device=device)
+def get_segment_indices(lengths, n_samples, segment_length, stride, firsts_only):
+    local_device = lengths.device
+    song_indices = (torch.rand(n_samples) * lengths.shape[0]).to(dtype=torch.long, device=local_device)
+    start_frames = (torch.rand(n_samples, device=local_device) * (lengths[song_indices] - segment_length)).to(
+        dtype=torch.long,
+        device=local_device,
+    )
     if firsts_only:
-        # t_start = torch.zeros_like(t_start)  # first frames
-        t_start = torch.ones_like(t_start) * (lengths[idxs] - segment_length - 1)  # last frames
-    segment_ts = torch.arange(0, segment_length, stride, device=device) + t_start[:, None]
-    segment_its = torch.cat(
+        start_frames = torch.ones_like(start_frames) * (lengths[song_indices] - segment_length - 1)
+
+    frame_indices = torch.arange(0, segment_length, stride, device=local_device) + start_frames[:, None]
+    return torch.cat(
         [
-            idxs[:, None, None].repeat_interleave(segment_ts.shape[-1], 1),
-            segment_ts[:, :, None],
+            song_indices[:, None, None].repeat_interleave(frame_indices.shape[-1], 1),
+            frame_indices[:, :, None],
         ],
         dim=2,
     )
-    return segment_its
-
-
-def nanpad(tensor: torch.Tensor, pad_until: int, dim: int = -1):
-    length_to_go = np.maximum(pad_until - tensor.shape[dim], 0)
-    good_shape = torch.Size(torch.maximum(torch.as_tensor(tensor.shape), torch.as_tensor(1)))
-    nanpad = torch.ones(good_shape, device=tensor.device) * torch.nan
-    nanpad = nanpad[[dim]].repeat_interleave(length_to_go, dim=dim)
-    padded_tensor = torch.cat([tensor, nanpad], dim=dim)
-    return padded_tensor

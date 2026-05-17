@@ -18,130 +18,68 @@ device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cp
 
 
 def load_3p(xror, rescale_yes=False):
-    # XROR processing
-    # beatmap, map_info = open_beatmap_from_unpacked_xror(xror)
     frames_np = np.array(xror.data["frames"])
     if frames_np.shape[0] < 2048:
         raise ValueError("XROR file has less than 2048 frames")
 
-    my_pos_quat, my_pos_sixd, timestamps = extract_3p_with_60fps(frames_np)
-    my_pos_quat = my_pos_quat.reshape(-1, 3, 7)
+    trajectory_quat, trajectory_sixd, timestamps = extract_3p_with_60fps(frames_np)
+    trajectory_quat = trajectory_quat.reshape(-1, 3, 7)
     if rescale_yes:
-        ratio = 1.5044 / np.nanmedian(my_pos_quat[:, 0, 1])  # head height
-        difference = 1.5044 - np.nanmedian(my_pos_quat[:, 0, 1])  # head height
+        height_shift = 1.5044 - np.nanmedian(trajectory_quat[:, 0, 1])
     else:
-        ratio = 1
-        difference = 0
+        height_shift = 0
 
-    my_pos_sixd = my_pos_sixd.reshape(-1, 3, 9)
-    my_pos_sixd[..., 1] += difference
-    my_pos_quat[..., 1] += difference
+    trajectory_sixd = trajectory_sixd.reshape(-1, 3, 9)
+    trajectory_sixd[..., 1] += height_shift
+    trajectory_quat[..., 1] += height_shift
 
-    median_xys = np.nanmedian(my_pos_sixd[:, [0], [0, 2]], axis=0)
-    my_pos_sixd[..., [0, 2]] -= median_xys[None]
-    my_pos_quat[..., [0, 2]] -= median_xys[None]
+    median_head_xy = np.nanmedian(trajectory_sixd[:, [0], [0, 2]], axis=0)
+    trajectory_sixd[..., [0, 2]] -= median_head_xy[None]
+    trajectory_quat[..., [0, 2]] -= median_head_xy[None]
 
-    # correct for strange jumps
-    for i in [2]:
+    for axis_index in [2]:
         try:
-            kde = gaussian_kde(my_pos_sixd[..., 0, i])
-            ls = np.linspace(-1, 1, 1000)
-            dens = kde.evaluate(ls)
-            peak_idxs = find_peaks(dens, distance=1000)[0]
-            peaks = ls[peak_idxs]
-            peak_diffs = np.abs(peaks[None] - my_pos_sixd[..., 0, i][:, None])
-            relevant_peak_idxs = np.argmin(peak_diffs, axis=-1)
-            my_pos_sixd[..., i] -= peaks[relevant_peak_idxs][..., None]
-            my_pos_quat[..., i] -= peaks[relevant_peak_idxs][..., None]
-        except Exception as e:
+            kde = gaussian_kde(trajectory_sixd[..., 0, axis_index])
+            grid = np.linspace(-1, 1, 1000)
+            density = kde.evaluate(grid)
+            peak_indices = find_peaks(density, distance=1000)[0]
+            peaks = grid[peak_indices]
+            peak_diffs = np.abs(peaks[None] - trajectory_sixd[..., 0, axis_index][:, None])
+            closest_peak_indices = np.argmin(peak_diffs, axis=-1)
+            trajectory_sixd[..., axis_index] -= peaks[closest_peak_indices][..., None]
+        except Exception:
             pass
 
-    my_pos_sixd = my_pos_sixd.reshape(-1, 27)
-    my_pos_quat = my_pos_quat.reshape(-1, 21)
-
-    return my_pos_quat, my_pos_sixd, timestamps
+    return trajectory_sixd.reshape(-1, 27), timestamps
 
 
 def load_cbo_and_3p(xror, beatmap, map_info, left_handed=False, rescale_yes=False):
-    # XROR processing
-    left_handed_yes = left_handed
-    notes_np, bombs_np, obstacles_np = get_cbo_np(beatmap, map_info, left_handed_yes)
-    xyzquats, my_pos_sixd, timestamps = load_3p(xror, rescale_yes=rescale_yes)
-    # In case XROR 3p trajectory is truncated, cut CBO to match
+    notes_np, bombs_np, obstacles_np = get_cbo_np(beatmap, map_info, left_handed)
+    trajectory_sixd, timestamps = load_3p(xror, rescale_yes=rescale_yes)
     song_duration = timestamps.max()
     notes_np = notes_np[notes_np[:, 0] <= song_duration]
     bombs_np = bombs_np[bombs_np[:, 0] <= song_duration]
     obstacles_np = obstacles_np[obstacles_np[:, 0] <= song_duration]
-    d = {
+    return {
         "notes_np": notes_np,
         "bombs_np": bombs_np,
         "obstacles_np": obstacles_np,
-        "xyzquats": xyzquats,
-        "gt_3p_np": my_pos_sixd,
+        "gt_3p_np": trajectory_sixd,
         "timestamps": timestamps,
         "xror_info": xror.data["info"],
     }
-    return d
-
-
-def open_xror(filename):
-    # XROR processing
-    (
-        beatmap,
-        song_info,
-        song_duration,
-    ) = open_beatmap_from_bsmg_or_boxrr(None, filename)
-    notes_np, bombs_np, obstacles_np = get_cbo_np(beatmap, song_info)
-    with open(filename, "rb") as f:
-        file = f.read()
-    xror = XROR.unpack(file)
-    frames_np = np.array(xror.data["frames"])
-    my_pos_quat, my_pos_sixd, timestamps = extract_3p_with_60fps(frames_np)
-    # quick static scaling. eventually needs refactoring
-    my_pos_quat = my_pos_quat.reshape(-1, 3, 7)
-    # xz = np.nanmedian(my_pos_expm[:100, 0, [0, 2]], axis=0)
-    # my_pos_expm[..., [0, 2]] -= xz
-    ratio = 1.5044 / np.nanmedian(my_pos_quat[-100:, 0, 1])  # head height
-    # Project to head & residual space for scaling
-    my_pos_quat[..., 1:, :3] -= my_pos_quat[..., [0], :3]
-    my_pos_quat[..., 0, 1] *= ratio
-    my_pos_quat[..., 1:, :3] *= ratio
-    my_pos_quat[..., 1:, :3] += my_pos_quat[..., [0], :3]
-    my_pos_quat = my_pos_quat.reshape(-1, 21)
-
-    my_pos_sixd = my_pos_sixd.reshape(-1, 3, 9)
-    my_pos_sixd[..., 1:, :3] -= my_pos_sixd[..., [0], :3]
-    my_pos_sixd[..., 0, 1] *= ratio
-    my_pos_sixd[..., 1:, :3] *= ratio
-    my_pos_sixd[..., 1:, :3] += my_pos_sixd[..., [0], :3]
-    my_pos_sixd = my_pos_sixd.reshape(-1, 27)
-
-    # nan_yes = np.isnan(my_pos_expm)
-    # my_pos_expm[nan_yes] = 0
-
-    d = {
-        "notes_np": notes_np,
-        "bombs_np": bombs_np,
-        "obstacles_np": obstacles_np,
-        # "gt_3p_np": my_pos_expm,
-        "gt_3p_np": my_pos_sixd,
-        "timestamps": timestamps,
-    }
-    return d
 
 
 def open_bsmg(filename, difficulty):
-    # BSMG processing
     beatmap, map_info, song_duration = open_beatmap_from_bsmg_or_boxrr(filename, None, difficulty)
     notes_np, bombs_np, obstacles_np = get_cbo_np(beatmap, map_info)
     timestamps = np.arange(0, song_duration, 1 / 60)
-    d = {
+    return {
         "notes_np": notes_np,
         "bombs_np": bombs_np,
         "obstacles_np": obstacles_np,
         "timestamps": timestamps,
-    }
-    return d, beatmap, map_info
+    }, beatmap, map_info
 
 
 def open_beatmap_from_bsmg_or_boxrr(zip_path: str, xror_path: str, difficulty: str):
@@ -163,17 +101,13 @@ def open_beatmap_from_bsmg_or_boxrr(zip_path: str, xror_path: str, difficulty: s
         print(f"File downloaded successfully as {zip_path}")
     info_filename = "Info.dat"
     with zipfile.ZipFile(zip_path) as zipf:
-        # Load map info
         try:
             with zipf.open(info_filename) as f:
                 map_info = json.load(f)
         except KeyError:
             info_filename = "info.dat"
-            try:
-                with zipf.open(info_filename) as f:
-                    map_info = json.load(f)
-            except KeyError as e:
-                raise e
+            with zipf.open(info_filename) as f:
+                map_info = json.load(f)
 
         song_filename = map_info["_songFilename"]
         try:
@@ -183,7 +117,7 @@ def open_beatmap_from_bsmg_or_boxrr(zip_path: str, xror_path: str, difficulty: s
                 except MutagenError:
                     audio = OggOpus(f)
             song_duration = audio.info.length
-        except KeyError as e:
+        except KeyError:
             try:
                 song_filenames = [fl.filename for fl in zipf.filelist if "song" in fl.filename.lower()]
                 if len(song_filenames) == 0:
@@ -196,20 +130,15 @@ def open_beatmap_from_bsmg_or_boxrr(zip_path: str, xror_path: str, difficulty: s
                     except MutagenError:
                         audio = OggOpus(f)
                 song_duration = audio.info.length
-            except KeyError as e:
-                # In case the song doesn't exist, use a heuristic, i.e. the last note/bomb/obstacle time
-                # pass
-                raise e
+            except KeyError:
+                raise
         try:
             with zipf.open(level_filename) as f:
                 beatmap = json.load(f)
         except KeyError:
             level_filename = level_filename.replace("Standard", "")
-            try:
-                with zipf.open(level_filename) as f:
-                    beatmap = json.load(f)
-            except KeyError as e:
-                raise e
+            with zipf.open(level_filename) as f:
+                beatmap = json.load(f)
 
     return beatmap, map_info, song_duration
 
@@ -257,13 +186,9 @@ def get_beatsaver_data(song_hashes):
     return beatsaver_data
 
 
-def get_cbo_np(beatmap, map_info, left_handed_yes=False):
-    # For tempo conversions
-    # Parse bpm events, whether given as _events or bpmEvents
-
+def get_cbo_np(beatmap, map_info, left_handed=False):
     base_bpm = map_info["_beatsPerMinute"]
     bpm_changes = [(0, base_bpm)]
-    # print(beatmap.keys())
     if "bpmEvents" in beatmap.keys():
         for bm in beatmap["bpmEvents"]:
             b = bm["b"]
@@ -271,13 +196,6 @@ def get_cbo_np(beatmap, map_info, left_handed_yes=False):
             if m == 0:
                 m = base_bpm
             bpm_changes.append((b, m))
-    # elif "_BPMChanges" in beatmap.keys():
-    #     for bm in beatmap["_BPMChanges"]:
-    #         b = bm["_time"]
-    #         m = bm["_BPM"]
-    #         if m == 0:
-    #             m = base_bpm
-    #         bpm_changes.append((b, m))
     elif "_events" in beatmap.keys():
         for event in beatmap["_events"]:
             if event["_type"] == 100:
@@ -288,11 +206,9 @@ def get_cbo_np(beatmap, map_info, left_handed_yes=False):
                 bpm_changes.append((b, m))
 
     if len(bpm_changes) == 1:
-        # bpm_changes.append((0.0, map_info["_beatsPerMinute"]))
         bpm_changes.append((0.0, base_bpm))
     bpm_changes = np.array(bpm_changes, dtype=float)
     sec_per_beat = 60.0 / bpm_changes[..., 1]
-    # cumulative seconds up to each tempo change
     cumulative_sec = np.zeros_like(bpm_changes[..., 0], dtype=float)
     durations_beats = bpm_changes[1:, 0] - bpm_changes[:-1, 0]
     durations_sec = durations_beats * sec_per_beat[:-1]
@@ -355,13 +271,10 @@ def get_cbo_np(beatmap, map_info, left_handed_yes=False):
             bombs_np.append(bomb_np)
     if len(bombs_np) > 0:
         bombs_np = np.stack(bombs_np, axis=0)
-        # bombs_np[:, 0] *= 60 / map_info["_beatsPerMinute"]
-        bombs_np = np.stack(bombs_np, axis=0)
         beat_idx = np.searchsorted(bpm_changes[..., 0], bombs_np[..., 0], side="left") - 1
         intercept = cumulative_sec[beat_idx]
         slope = sec_per_beat[beat_idx]
         bombs_np[:, 0] = intercept + slope * (bombs_np[:, 0] - bpm_changes[beat_idx, 0])
-
     else:
         bombs_np = np.empty((0, 5))
     obstacles_np = []
@@ -400,50 +313,35 @@ def get_cbo_np(beatmap, map_info, left_handed_yes=False):
             obstacles_np.append(obstacle_np)
     if len(obstacles_np) > 0:
         obstacles_np = np.stack(obstacles_np, axis=0)
-        # obstacles_np[:, 0] *= 60 / map_info["_beatsPerMinute"]
-        # obstacles_np[:, 4] *= 60 / map_info["_beatsPerMinute"]
-        obstacles_np = np.stack(obstacles_np, axis=0)
         beat_idx = np.searchsorted(bpm_changes[..., 0], obstacles_np[..., 0], side="left") - 1
         intercept = cumulative_sec[beat_idx]
         slope = sec_per_beat[beat_idx]
         obstacles_np[:, 0] = intercept + slope * (obstacles_np[:, 0] - bpm_changes[beat_idx, 0])
         obstacles_np[:, 4] = intercept + slope * (obstacles_np[:, 4] - bpm_changes[beat_idx, 0])
-
     else:
         obstacles_np = np.empty((0, 9))
 
-    # Handle left-handedness
-    if left_handed_yes:
-        # x position
+    if left_handed:
         notes_np[:, 3] = 3 - notes_np[:, 3]
-        # color
         notes_np[:, 5] = 1 - notes_np[:, 5]
-        # direction
-        left_yes = (notes_np[:, 6] == 2) | (notes_np[:, 6] == 4) | (notes_np[:, 6] == 6)
-        right_yes = (notes_np[:, 6] == 3) | (notes_np[:, 6] == 5) | (notes_np[:, 6] == 7)
-        notes_np[left_yes, 6] += 1
-        notes_np[right_yes, 6] -= 1
-        # bomb x position
+        left_directions = (notes_np[:, 6] == 2) | (notes_np[:, 6] == 4) | (notes_np[:, 6] == 6)
+        right_directions = (notes_np[:, 6] == 3) | (notes_np[:, 6] == 5) | (notes_np[:, 6] == 7)
+        notes_np[left_directions, 6] += 1
+        notes_np[right_directions, 6] -= 1
         bombs_np[:, 3] = 3 - bombs_np[:, 3]
-        # obstacle x position
         obstacles_np[:, 5] = 3 - obstacles_np[:, 5]
 
     return notes_np, bombs_np, obstacles_np
 
 
 def extract_3p_with_60fps(frames_np):
-    my_pos_quat, my_pos_sixd, timestamps = get_pos_expm(frames_np)
-    # timestamp quality control
+    my_pos_quat, my_pos_sixd, timestamps = get_pos_sixd(frames_np)
     last_zero_idx = np.where(timestamps < 1e-7)[0][-1]
     timestamps = timestamps[last_zero_idx:]
     my_pos_quat = my_pos_quat[last_zero_idx:]
     my_pos_sixd = my_pos_sixd[last_zero_idx:]
-    # Currently warping takes way too long....
-
-    # Linear spline reparameterization
     sixty_fps_timestamps = np.arange(0, np.max(timestamps), 1 / 60)
 
-    # Use bucketization to snap XROR timestamps to the 60fps version
     left_idxs = np.clip(np.searchsorted(timestamps, sixty_fps_timestamps, side="left") - 1, 0, timestamps.shape[0] - 1)
     right_idxs = np.clip(left_idxs + 1, 0, timestamps.shape[0] - 1)
 
@@ -451,87 +349,37 @@ def extract_3p_with_60fps(frames_np):
     center_stamps = sixty_fps_timestamps
     right_stamps = timestamps[right_idxs]
 
-    # Linear interpolation for my_pos_sixd (unchanged)
     all_3p = my_pos_sixd
     left_3p = all_3p[left_idxs]
     right_3p = all_3p[right_idxs]
     slope = (right_3p - left_3p) / (right_stamps - left_stamps)[:, None]
     interpolated = left_3p + slope * (center_stamps - left_stamps)[:, None]
 
-    # Interpolate my_pos_quat: linear for xyz, SLERP for quaternion
-    # my_pos_quat has shape (T, 3, 7) = [pos(3), quat(4)] per part
     denom = right_stamps - left_stamps
     t = np.where(denom > 1e-7, (center_stamps - left_stamps) / denom, 0.0)
 
-    left_pq = my_pos_quat[left_idxs]   # (T_60fps, 3, 7)
-    right_pq = my_pos_quat[right_idxs]  # (T_60fps, 3, 7)
+    left_pq = my_pos_quat[left_idxs]
+    right_pq = my_pos_quat[right_idxs]
 
-    # Linear interpolation for position (xyz)
     left_pos = left_pq[..., :3]
     right_pos = right_pq[..., :3]
     interp_pos = left_pos + t[:, None, None] * (right_pos - left_pos)
 
-    # SLERP for quaternion (x, y, z, w)
-    left_quat = left_pq[..., 3:]   # (T_60fps, 3, 4)
-    right_quat = right_pq[..., 3:]  # (T_60fps, 3, 4)
-    # Reshape for slerp: (T_60fps * 3, 4)
+    left_quat = left_pq[..., 3:]
+    right_quat = right_pq[..., 3:]
     left_quat_flat = left_quat.reshape(-1, 4)
     right_quat_flat = right_quat.reshape(-1, 4)
-    t_flat = np.repeat(t, 3)  # repeat t for each of the 3 parts
+    t_flat = np.repeat(t, 3)
     interp_quat_flat = slerp_quaternions(left_quat_flat, right_quat_flat, t_flat)
     interp_quat = interp_quat_flat.reshape(-1, 3, 4)
 
-    # Combine interpolated position and quaternion
-    interp_pos_quat = np.concatenate([interp_pos, interp_quat], axis=-1)  # (T_60fps, 3, 7)
-    interp_pos_quat = interp_pos_quat.reshape(-1, 21)  # flatten to (T_60fps, 21)
+    interp_pos_quat = np.concatenate([interp_pos, interp_quat], axis=-1)
+    interp_pos_quat = interp_pos_quat.reshape(-1, 21)
 
     return interp_pos_quat, interpolated, sixty_fps_timestamps
 
-    #
-    # batch_size = 1024
-    # idxs = np.arange(sixty_fps_timestamps.shape[0])
-    # n_batches = idxs.shape[0] // batch_size
-    # if n_batches > 0:
-    #     batch_idxs = np.array_split(idxs, n_batches)
-    # else:
-    #     batch_idxs = [idxs]
-    # batch_pos_expms = []
-    # batch_pos_sixds = []
-    # for batch_i in batch_idxs:
-    #     batch_sixties = sixty_fps_timestamps[batch_i]
-    #     # timestamp_yes = np.logical_and(batch_sixties.min() - 1 <= timestamps, timestamps <= batch_sixties.max() + 1)
-    #     # timestamp_yes = batch_sixties.min() - 1 <= timestamps
-    #     # timestamp_yes = timestamps <= batch_sixties.max()
-    #
-    #     # For each timestamp, identify the left and right points
-    #     # good_timestamps = timestamps[timestamp_yes]
-    #     good_timestamps = timestamps
-    #     for my_3p, res in [[my_pos_expm, batch_pos_expms], [my_pos_sixd, batch_pos_sixds]]:
-    #         # good_3p = my_3p[timestamp_yes]
-    #         good_3p = my_3p
-    #
-    #         a = good_timestamps[None] - batch_sixties[:, None]
-    #         # Last occurrence of negative
-    #         left_idxs = a.shape[-1] - np.argmax(a[..., ::-1] <= 0, axis=-1) - 1
-    #         # First occurrence of positive
-    #         right_idxs = np.argmax(a >= 0, axis=-1)
-    #         left = good_3p[left_idxs]
-    #         right = good_3p[right_idxs]
-    #         left_times = good_timestamps[left_idxs]
-    #         right_times = good_timestamps[right_idxs]
-    #         denom = np.clip(right_times - left_times, 1e-7, None)
-    #         slopes = (right - left) / denom[..., None]
-    #         interpolated = left + slopes * (batch_sixties - left_times)[..., None]
-    #         res.append(interpolated)
-    #
-    # my_pos_expm = np.concatenate(batch_pos_expms, axis=0)
-    # my_pos_sixd = np.concatenate(batch_pos_sixds, axis=0)
-    # timestamps = sixty_fps_timestamps
 
-    # return my_pos_expm, my_pos_sixd, timestamps
-
-
-def get_pos_expm(frames_np):
+def get_pos_sixd(frames_np):
     timestamps = frames_np[1:, ..., 0]
     part_data = frames_np[1:, ..., 1:]
     part_data = part_data.reshape(part_data.shape[0], 3, -1)
@@ -541,26 +389,8 @@ def get_pos_expm(frames_np):
     my_sixd = my_rot.as_matrix()[..., :2].swapaxes(-2, -1).reshape(*my_quat.shape[:-1], 6)
     my_pos_sixd = np.concatenate([my_pos, my_sixd], axis=-1)
     my_pos_sixd = my_pos_sixd.reshape(-1, 27)
-    my_expm = quat_to_expm(my_quat)
-    my_pos_expm = np.concatenate([my_pos, my_expm], axis=-1)
-    my_pos_expm = my_pos_expm.reshape(-1, 18)
     my_pos_quat = np.concatenate([my_pos, my_quat], axis=-1)
     return my_pos_quat, my_pos_sixd, timestamps
-
-
-def quat_to_expm(quat: np.ndarray, eps: float = 1e-8):
-    """
-    Quaternion is (x, y, z, w)
-    """
-    im = quat[..., :3]
-    im_norm = np.linalg.norm(im, axis=-1)
-    half_angle = np.arctan2(im_norm, quat[..., 3])
-    expm = np.where(
-        im_norm[..., None] < eps,
-        im,
-        half_angle[..., None] * (im / im_norm[..., None]),
-    )
-    return expm
 
 
 def slerp_quaternions(q0: np.ndarray, q1: np.ndarray, t: np.ndarray, eps: float = 1e-6):
@@ -578,36 +408,27 @@ def slerp_quaternions(q0: np.ndarray, q1: np.ndarray, t: np.ndarray, eps: float 
     Returns:
         Interpolated quaternions, shape (..., 4), normalized
     """
-    # Normalize inputs
     q0 = q0 / np.linalg.norm(q0, axis=-1, keepdims=True)
     q1 = q1 / np.linalg.norm(q1, axis=-1, keepdims=True)
 
-    # Compute dot product
     dot = np.sum(q0 * q1, axis=-1, keepdims=True)
 
-    # Flip q1 where dot < 0 to ensure shortest path
     q1 = np.where(dot < 0, -q1, q1)
     dot = np.abs(dot)
 
-    # Clamp dot to valid range for arccos
     dot = np.clip(dot, -1.0, 1.0)
 
-    # Compute angle
     theta = np.arccos(dot)
 
-    # Expand t for broadcasting with quaternion components
     t_expanded = t[..., None] if t.ndim < q0.ndim else t
 
-    # Use slerp where angle is large enough, else use normalized lerp
     sin_theta = np.sin(theta)
     use_slerp = sin_theta > eps
 
-    # SLERP formula: (sin((1-t)*theta)/sin(theta)) * q0 + (sin(t*theta)/sin(theta)) * q1
     s0 = np.where(use_slerp, np.sin((1.0 - t_expanded) * theta) / sin_theta, 1.0 - t_expanded)
     s1 = np.where(use_slerp, np.sin(t_expanded * theta) / sin_theta, t_expanded)
 
     result = s0 * q0 + s1 * q1
 
-    # Normalize the result
     result = result / np.linalg.norm(result, axis=-1, keepdims=True)
     return result

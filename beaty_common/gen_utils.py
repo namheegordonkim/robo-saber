@@ -1,167 +1,140 @@
 import os
-import numpy as np
+
 import torch
 
-from beaty_common.pose_utils import interpolate_xyzsixd
-from vendor.torch_saber import TorchSaber
-from beaty_common.train_utils import placeholder_3p_sixd, nanpad_collate_fn
 from beaty_common.bsmg_xror_utils import open_bsmg
+from beaty_common.data_utils import sample_for_evaluation
 from beaty_common.eval_utils import get_njs
-from beaty_common.data_utils import SegmentSampler
+from beaty_common.pose_utils import interpolate_xyzsixd
+from beaty_common.train_utils import nanpad_collate_fn, placeholder_3p_sixd
+from beaty_common.torch_nets import GameTensors
+from vendor.torch_saber import TorchSaber
+
+PLAYER_HEIGHT = 1.5044
+GENERATION_SAMPLE_COUNT = 1
+GENERATION_MINIBATCH_SIZE = 512
+GENERATION_SEGMENT_STRIDE = 1
+DEFAULT_CHARACTERISTIC = "Standard"
 
 
 def generate_3p_work(
     device,
     execution_horizon,
-    game_segments,
-    gsvae_net,
-    history_len,
+    sampled_song,
+    trajectory_decoder,
+    history_length,
     length,
-    pred_net,
+    style_predictor,
     stride,
     note_profiles,
     bomb_profiles,
     obstacle_profiles,
     argmax_yes,
-    gt_3p,
-    njs,
+    note_jump_speed,
     playstyle_tokens: torch.Tensor,
     playstyle_mask: torch.Tensor,
     n_cands: int,
     temperature: float,
     topk: int,
 ):
-    w_ins = [torch.as_tensor(placeholder_3p_sixd[None, None], device=device) for t in range(history_len)]
-    n_notes = note_profiles.shape[1]
-    note_alive_mask = torch.ones((game_segments.notes.shape[0], n_cands, n_notes), dtype=torch.bool, device=device)
-    generated_cands = [torch.as_tensor(placeholder_3p_sixd[None, None, None], device=device).unflatten(-1, (3, -1)).repeat_interleave(n_cands, 1) for t in range(history_len)]
+    generated_windows = [torch.as_tensor(placeholder_3p_sixd[None, None], device=device) for frame_index in range(history_length)]
+    note_alive_mask = torch.ones(
+        (sampled_song.notes.shape[0], n_cands, note_profiles.shape[1]),
+        dtype=torch.bool,
+        device=device,
+    )
+    generated_candidates = [
+        torch.as_tensor(placeholder_3p_sixd[None, None, None], device=device).unflatten(-1, (3, -1)).repeat_interleave(n_cands, 1)
+        for frame_index in range(history_length)
+    ]
 
     with torch.no_grad():
-        for t in range(0, length):
-            w_in = torch.cat(w_ins[-history_len:], dim=1)  # history
-            notes_in = game_segments.notes[:, t].to(device=device)
-            bombs_in = game_segments.bombs[:, t].to(device=device)
-            obstacles_in = game_segments.obstacles[:, t].to(device=device)
+        for frame_index in range(length):
+            history_window = torch.cat(generated_windows[-history_length:], dim=1)
+            current_notes = sampled_song.notes[:, frame_index].to(device=device)
+            current_bombs = sampled_song.bombs[:, frame_index].to(device=device)
+            current_obstacles = sampled_song.obstacles[:, frame_index].to(device=device)
 
-            if t % (execution_horizon * stride) == 0:
-                # Query the model
-                game_obj_embeds, game_obj_mask, game_hist_embeds, game_hist_mask = pred_net.encode_game(
-                    notes_in,
-                    bombs_in,
-                    obstacles_in,
-                    w_in,
-                )
-                z = pred_net.predict_logits_from_embeds(
-                    game_obj_embeds,
-                    game_obj_mask,
-                    game_hist_embeds,
-                    game_hist_mask,
-                    playstyle_tokens * 1,
-                    playstyle_mask,
-                )
-                z, k, z_soft, z_hard, _ = pred_net.sample_from_z(
-                    z,
-                    n=n_cands if not argmax_yes else 1,
-                    temperature=temperature,
-                    topk=topk,
-                )
-                if argmax_yes:
-                    decoded = gsvae_net.decode(k)
-                else:
-                    decoded = gsvae_net.decode(z_hard)
+            if frame_index % (execution_horizon * stride) != 0:
+                continue
 
-                keypoints = torch.cat([w_in[:, [-1], None].repeat_interleave(decoded.shape[1], 1), decoded], dim=2)
+            game_object_embeddings, game_object_mask, game_history_embeddings, game_history_mask = style_predictor.encode_game(
+                GameTensors(current_notes, current_bombs, current_obstacles, history_window)
+            )
+            logits = style_predictor.predict_logits_from_embeds(
+                game_object_embeddings,
+                game_object_mask,
+                game_history_embeddings,
+                game_history_mask,
+                playstyle_tokens * 1,
+                playstyle_mask,
+            )
+            _, decoded_tokens, _, hard_samples, _ = style_predictor.sample_from_z(
+                logits,
+                n=n_cands if not argmax_yes else 1,
+                temperature=temperature,
+                topk=topk,
+            )
+            if argmax_yes:
+                decoded_windows = trajectory_decoder.decode(decoded_tokens)
+            else:
+                decoded_windows = trajectory_decoder.decode(hard_samples)
 
-                # Interpolate the model output for evaluation
-                y_cands = interpolate_xyzsixd(keypoints, stride)
-                y_cands_ = y_cands.reshape((*y_cands.shape[:-1], 3, -1))
+            candidate_keypoints = torch.cat(
+                [history_window[:, [-1], None].repeat_interleave(decoded_windows.shape[1], 1), decoded_windows],
+                dim=2,
+            )
+            candidate_trajectories = interpolate_xyzsixd(candidate_keypoints, stride)
+            candidate_trajectories = candidate_trajectories.reshape((*candidate_trajectories.shape[:-1], 3, -1))
 
-                # Evaluate candidate trajectories
-                hi = np.min([t + y_cands.shape[-2], length])
-                carry = w_in[:, None, [-1]].unflatten(-1, (3, -1))
-                carry_shape = [
-                    1,
-                ] * len(carry.shape)
-                carry_shape[1] = y_cands_.shape[1]
-                carry = carry.repeat(carry_shape)
-                res = TorchSaber.evaluate_and_simulate(
-                    carry,
-                    y_cands_[:, ..., : hi - t, :, :],
-                    game_segments.notes[:, t:hi][:, None].repeat_interleave(n_cands, 1),
-                    game_segments.bombs[:, t:hi][:, None].repeat_interleave(n_cands, 1),
-                    game_segments.obstacles[:, t:hi][:, None].repeat_interleave(n_cands, 1),
-                    game_segments.note_ids[:, t:hi][:, None].repeat_interleave(n_cands, 1),
-                    game_segments.bomb_ids[:, t:hi][:, None].repeat_interleave(n_cands, 1),
-                    game_segments.obstacle_ids[:, t:hi][:, None].repeat_interleave(n_cands, 1),
-                    note_profiles,
-                    bomb_profiles,
-                    obstacle_profiles,
-                    note_alive_mask,
-                    1.5044,
-                    njs,
-                )
+            stop_frame = min(frame_index + candidate_trajectories.shape[-3], length)
+            carry_state = history_window[:, None, [-1]].unflatten(-1, (3, -1))
+            carry_state = carry_state.repeat(1, candidate_trajectories.shape[1], 1, 1, 1)
+            (
+                normalized_score,
+                n_opportunities,
+                n_hits,
+                n_misses,
+                n_goods,
+                collided_note_mask,
+                bomb_penalty,
+                obstacle_penalty,
+            ) = TorchSaber.evaluate_and_simulate(
+                carry_state,
+                candidate_trajectories[:, :, : stop_frame - frame_index],
+                sampled_song.notes[:, frame_index:stop_frame][:, None].repeat_interleave(n_cands, 1),
+                sampled_song.bombs[:, frame_index:stop_frame][:, None].repeat_interleave(n_cands, 1),
+                sampled_song.obstacles[:, frame_index:stop_frame][:, None].repeat_interleave(n_cands, 1),
+                sampled_song.note_ids[:, frame_index:stop_frame][:, None].repeat_interleave(n_cands, 1),
+                sampled_song.bomb_ids[:, frame_index:stop_frame][:, None].repeat_interleave(n_cands, 1),
+                sampled_song.obstacle_ids[:, frame_index:stop_frame][:, None].repeat_interleave(n_cands, 1),
+                note_profiles,
+                bomb_profiles,
+                obstacle_profiles,
+                note_alive_mask,
+                PLAYER_HEIGHT,
+                note_jump_speed,
+            )
 
-                deltas = decoded[:, :, 0] - w_in[:, [-1]]
-                dists = torch.norm(deltas, dim=-1)
-                pos_continuity_score = torch.exp(-(dists**2))
-                pos_continuity_score[pos_continuity_score.isnan()] = 0
+            candidate_score = 1.0 + normalized_score[0] - 10.0 * bomb_penalty[0] + 10.0 * obstacle_penalty[0]
+            best_candidate_index = torch.argmax(candidate_score, dim=-1)
 
-                history_vel = w_in[:, [-1]] - w_in[:, [-2]]
-                # mean_vel = torch.mean(keypoints[..., 1:, :] - keypoints[..., :-1, :], dim=-2)
-                vel_diff = torch.norm(history_vel - deltas, dim=-1)
-                # vel_diff = torch.norm(history_vel - mean_vel, dim=-1)
-                vel_continuity_score = torch.exp(-(vel_diff**2))
-                vel_continuity_score[vel_continuity_score.isnan()] = 0
+            selected_collision_mask = collided_note_mask[
+                torch.arange(collided_note_mask.shape[0]),
+                best_candidate_index,
+            ][:, None]
+            note_alive_mask = note_alive_mask & ~selected_collision_mask
+            best_decoded_window = decoded_windows[torch.arange(decoded_windows.shape[0]), best_candidate_index]
 
-                diffs = y_cands[:, :, 1:] - y_cands[:, :, :-1]
-                diffdiffs = diffs[:, :, 1:] - diffs[:, :, :-1]
-                diffdiffdiffs = diffdiffs[:, :, 1:] - diffdiffs[:, :, :-1]
+            generated_candidates.append(decoded_windows.reshape(*decoded_windows.shape[:-1], 3, -1))
+            for step_index in range(execution_horizon):
+                if step_index >= best_decoded_window.shape[1]:
+                    break
+                generated_windows.append(best_decoded_window[:, None, step_index])
 
-                head_xy_mags = torch.norm(y_cands_[..., 0, :1], dim=-1).mean(-1)
-                ref_head_xyz = torch.tensor([0, 1.5044, 0], device=device).repeat(*y_cands_[..., 0, :3].shape[:-1], 1)
-                head_deviation = torch.norm(y_cands_[..., 0, :3] - ref_head_xyz, dim=-1).mean(-1)
-                hand_xyz_mags = torch.norm(y_cands_[..., 1:, :3], dim=-1).mean(-1).mean(-1)
-                vels = torch.norm(diffs, dim=-1).mean(-1)
-                accs = torch.norm(diffdiffs, dim=-1).mean(-1)
-                jerks = torch.norm(diffdiffdiffs, dim=-1).mean(-1)
-
-                head_xy_score = torch.exp(-(head_xy_mags**2))
-                hand_xyz_score = torch.exp(-(hand_xyz_mags**2))
-                head_deviation_score = torch.exp(-(head_deviation**2))
-                vel_score = torch.exp(-(vels**2))
-                acc_score = torch.exp(-(accs**2))
-                jerk_score = torch.exp(-(jerks**2))
-
-                # best_idx = (
-                #     torch.argmax(
-                #         1e0 * res[0][0],
-                #         dim=-1,
-                #         keepdim=False,
-                #     )
-                #     * 1
-                # )
-                final_score = 1e0 + res[0][0] - 1e1 * res[-2][0] + 1e1 * res[-1][0]
-                best_idx = torch.argmax(final_score, dim=-1, keepdim=False) * 1
-                # print(res[0][0])
-                # print(final_score)
-                # print(best_idx)
-
-                note_alive_mask = note_alive_mask & ~res[5][:, [best_idx]]
-                y_out = decoded[torch.arange(decoded.shape[0]), best_idx]
-                # if gt_3p is not None and t < 500:
-                #     y_out = gt_3p[:, t:hi:stride]
-
-                generated_cands.append(decoded.reshape(*decoded.shape[:-1], 3, -1))
-                # note_alive_mask = note_alive_mask & (~res[-3][torch.arange(decoded.shape[0]), best_idx])
-                for i in range(execution_horizon):
-                    if i >= y_out.shape[1]:
-                        break
-                    w_ins.append(y_out[:, None, i])
-    # generated_3p = torch.cat(w_ins, dim=1)
-    generated_3p = torch.cat(w_ins[history_len:], dim=1)
-    # generated_cands = torch.cat(generated_cands, dim=2)
-    generated_cands = torch.cat(generated_cands[history_len:], dim=2)
-    return generated_3p, generated_cands
+    generated_3p = torch.cat(generated_windows[history_length:], dim=1)
+    generated_candidates = torch.cat(generated_candidates[history_length:], dim=2)
+    return generated_3p, generated_candidates
 
 
 def generate_3p_from_style_embeddings(
@@ -169,93 +142,63 @@ def generate_3p_from_style_embeddings(
     playstyle_mask: torch.Tensor,
     song_hash: str,
     difficulty: str,
-    pred_net,
-    gsvae_net,
+    style_predictor,
+    trajectory_decoder,
     device,
     chunk_length: int,
-    history_len: int,
+    history_length: int,
     lookahead: float = 2.0,
     n_cands: int = 32,
     temperature: float = 1.0,
     topk: int = 0,
     argmax_yes: bool = False,
-    characteristic: str = "Standard",
+    characteristic: str = DEFAULT_CHARACTERISTIC,
     purview_notes: int = 20,
     floor_time: float = -0.1,
 ):
-    """
-    Generate segment_3p and cand_3p from playstyle embeddings.
+    os.makedirs("data/BeatSaver", exist_ok=True)
+    collated, beatmap, map_info = open_bsmg(f"data/BeatSaver/{song_hash.upper()}.zip", difficulty)
+    note_jump_speed = get_njs(map_info, difficulty, characteristic)
 
-    Args:
-        playstyle_tokens: Encoded playstyle tokens from pred_net.encode_style()
-        playstyle_mask: Playstyle mask from pred_net.encode_style()
-        song_hash: Song hash identifier
-        difficulty: Difficulty level (e.g., "Expert", "ExpertPlus")
-        pred_net: Prediction network model
-        gsvae_net: GSVAE network model
-        device: Torch device
-        lookahead: Lookahead parameter for segment sampling (default 2.0)
-        n_cands: Number of candidates for generation (default 32)
-        temperature: Temperature for sampling (default 1.0)
-        argmax_yes: Whether to use argmax sampling (default False)
-        characteristic: Beatmap characteristic (default "Standard")
-        purview_notes: Number of notes in purview (default 20)
-        floor_time: Floor time for segment sampling (default -0.1)
+    collated = nanpad_collate_fn([[collated]])
+    length = collated["timestamps"].shape[1]
+    for name, value in collated.items():
+        collated[name] = value.to(device=device)
 
-    Returns:
-        segment_3p: Interpolated and processed 3P trajectory
-        cand_3p: Interpolated and processed candidate trajectories
-    """
-    zip_dir = "data/BeatSaver"
-    os.makedirs(zip_dir, exist_ok=True)
-    zip_path = f"{zip_dir}/{song_hash.upper()}.zip"
-    d, beatmap, map_info = open_bsmg(zip_path, difficulty)
-    njs = get_njs(map_info, difficulty, characteristic)
-
-    d = nanpad_collate_fn([[d]])
-    length = d["timestamps"].shape[1]
-    for k, v in d.items():
-        d[k] = v.to(device=device)
-    note_profiles = d["notes_np"]
-    bomb_profiles = d["bombs_np"]
-    obstacle_profiles = d["obstacles_np"]
-    length = d["timestamps"].shape[1]
-
-    segment_sampler = SegmentSampler()
-    game_segments_ = segment_sampler.sample_for_evaluation(
+    note_profiles = collated["notes_np"]
+    bomb_profiles = collated["bombs_np"]
+    obstacle_profiles = collated["obstacles_np"]
+    sampled_song = sample_for_evaluation(
         note_profiles,
         bomb_profiles,
         obstacle_profiles,
-        d["timestamps"],
-        d["lengths"],
+        collated["timestamps"],
+        collated["lengths"],
         length,
-        1,
-        512,
-        1,
+        GENERATION_SAMPLE_COUNT,
+        GENERATION_MINIBATCH_SIZE,
+        GENERATION_SEGMENT_STRIDE,
         lookahead,
         purview_notes,
         floor_time,
     )
 
-    stride = gsvae_net.stride
-
-    execution_horizon = (chunk_length // stride) // 1
-
-    generated_3p, cand_3p = generate_3p_work(
+    stride = trajectory_decoder.stride
+    execution_horizon = chunk_length // stride
+    generated_3p, candidate_3p = generate_3p_work(
         device,
         execution_horizon,
-        game_segments_,
-        gsvae_net,
-        history_len,
+        sampled_song,
+        trajectory_decoder,
+        history_length,
         length,
-        pred_net,
+        style_predictor,
         stride,
         note_profiles,
         bomb_profiles,
         obstacle_profiles,
         argmax_yes,
-        None,
-        njs,
+        note_jump_speed,
         playstyle_tokens,
         playstyle_mask,
         n_cands,
@@ -263,14 +206,9 @@ def generate_3p_from_style_embeddings(
         topk,
     )
 
-    interpolated_3p = interpolate_xyzsixd(generated_3p[:, None], stride)
-    segment_3p = interpolated_3p[:, :, :length]
-    segment_3p = segment_3p.reshape(*(segment_3p.shape[:-1]), 3, -1)
-    # segment_3p = segment_3p[:, :, history_len:]
+    generated_3p = interpolate_xyzsixd(generated_3p[:, None], stride)[:, :, :length]
+    generated_3p = generated_3p.reshape((*generated_3p.shape[:-1], 3, -1))
 
-    interpolated_cands = interpolate_xyzsixd(cand_3p, stride)
-    cand_3p = interpolated_cands[:, :, :length]
-    cand_3p = cand_3p.reshape(*(cand_3p.shape[:-1]), 3, -1)
-    # cand_3p = cand_3p[:, :, history_len:]
-
-    return segment_3p, cand_3p
+    candidate_3p = interpolate_xyzsixd(candidate_3p, stride)[:, :, :length]
+    candidate_3p = candidate_3p.reshape((*candidate_3p.shape[:-1], 3, -1))
+    return generated_3p, candidate_3p
