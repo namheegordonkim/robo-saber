@@ -30,7 +30,7 @@ rule prepare:
     message:
         "Downloading pretrained model and data manifests from prepare.py (Google Drive)."
     shell:
-        "uv run robo-saber/prepare.py"
+        "python robo-saber/prepare.py"
 
 
 rule generate:
@@ -45,8 +45,23 @@ rule generate:
     message:
         "Generating 3P trajectories and writing out/gen3p.nc."
     shell:
-        "uv run robo-saber/generate.py "
+        "python robo-saber/generate.py "
         "--csv_path {params.csv_path:q} "
         "--target_player_source {params.target_player_source:q} "
         "--clean_models_bundle {input.pretrained:q} "
         "--boxrr23_manifest_path {input.boxrr23_manifest:q}"
+
+
+rule train:
+    input:
+        pretrained=rules.prepare.output.pretrained,
+        boxrr23_manifest=rules.prepare.output.boxrr23_manifest,
+        heldout_maps=rules.prepare.output.heldout_maps,
+        placeholder_sixd=rules.prepare.output.placeholder_sixd,
+    output:
+        checkpoint="out/train/checkpoint.pkl",
+        pretrained="out/train/pretrained.pkl",
+    message:
+        "Training the generator pair and writing checkpoints to out/train."
+    shell:
+        "python robo-saber/train.py --out-dir out/train"

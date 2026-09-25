@@ -2,12 +2,11 @@
 __pycache__/
 *.egg-info/
 checkpoints/
-.uv-cache/
+.pixi/
 *.csv
 *.txt
 *.pkl
 *.zip
-uv.lock
 .vscode
 .snakemake/
 out/

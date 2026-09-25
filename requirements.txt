@@ -1,10 +1,12 @@
-# Direct runtime dependencies for the released inference workflow.
+# Direct runtime dependencies for inference and training.
 # Keep this list tight; do not commit full environment dumps here.
 
 beautifulsoup4==4.14.2
+datasets==5.0.1
 fpzip==1.2.5
 h5netcdf==1.8.1
 h5py==3.16.0
+huggingface-hub==1.33.0
 mutagen==1.47.0
 numpy==2.2.6
 pandas==2.3.3
@@ -13,6 +15,7 @@ pyvista==0.46.3
 requests==2.32.5
 scipy==1.16.2
 snakemake==9.11.7
+tensorboard==2.21.0
 torch==2.8.0
 tqdm==4.67.1
 xarray==2026.4.0

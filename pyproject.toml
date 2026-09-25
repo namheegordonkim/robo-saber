@@ -5,6 +5,19 @@ description = "Robo-Saber: Generating and Simulating VR Players"
 requires-python = "==3.11.*"
 dynamic = ["dependencies"]
 
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[tool.pixi.dependencies]
+python = "3.11.13.*"
+
+[tool.pixi.pypi-dependencies]
+robo-saber = { path = ".", editable = true }
+datasets = "==5.0.1"
+huggingface-hub = "==1.33.0"
+tensorboard = "==2.21.0"
+
 [tool.black]
 line-length = 1000000
 
