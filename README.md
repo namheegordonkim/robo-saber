@@ -228,3 +228,7 @@ The viewer is a fork of [ArcViewer](https://github.com/AllPoland/ArcViewer), so 
 ## Notes
 
 * Run commands from the repository root.
+
+## License
+
+Robo-Saber is released under the [MIT License](LICENSE). Code under `vendor/` keeps its original license; see the license file or file headers in each directory.
