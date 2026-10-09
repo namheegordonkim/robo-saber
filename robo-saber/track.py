@@ -1,5 +1,6 @@
 """Track generated 3-point trajectories with a physics-based humanoid (PHC in Isaac Gym Preview 4)."""
 
+import json
 import os
 import random
 from argparse import ArgumentParser, Namespace
@@ -125,6 +126,20 @@ class MyPlayer(im_amp_players.IMAMPPlayerContinuous):
                 },
                 attrs=attrs,
             ).to_netcdf(cfg.out_path, mode="w" if out_i == 0 else "a", group=group_name, engine="h5netcdf")
+
+            # Same group for the viewer's full-body robot
+            viewer_dir = os.path.splitext(cfg.out_path)[0]
+            os.makedirs(viewer_dir, exist_ok=True)
+            with open(f"{viewer_dir}/{group_name}.json", "w") as f:
+                json.dump(
+                    {
+                        "pos": np.round(root_pos, 6).tolist(),
+                        "rots": np.round(local_rot, 6).tolist(),
+                        "song_hash": attrs["Song Hash"],
+                        "difficulty": attrs["Difficulty Level"],
+                    },
+                    f,
+                )
 
 
 class MyRunner(Runner):

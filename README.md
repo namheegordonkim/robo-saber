@@ -29,7 +29,7 @@ The first run requires internet access. Generation currently assumes CUDA, so ru
 ## Status
 
 * [x] Inference code
-* [ ] Visualization code
+* [x] Visualization code
 * [x] Training code
 * [x] Physics-based tracking code
 
@@ -212,7 +212,19 @@ Everything is at 60 fps in the same coordinate frame as `gen3p.nc`. The controll
 
 `vendor/phc` is a trimmed, headless subset of PHC ([Luo et al., ICCV 2023](https://zhengyiluo.github.io/PHC/)) under its BSD 3-Clause Clear license; see `vendor/phc/LICENSE`.
 
+## Visualization
+
+`generate` and `track` also write each result as a small JSON file for the viewer: `out/gen3p/<n>.json` and `out/tracking/<n>.json`, numbered like the groups in the `.nc` files. To watch one, download the viewer for your system from the [Robo-Saber viewer releases](https://github.com/namheegordonkim/ArcViewer/releases), extract it, and open the file:
+
+```bash
+ArcViewer-Linux/ArcViewer.x86_64 out/gen3p/0.json     # generated head and sabers
+ArcViewer-Linux/ArcViewer.x86_64 out/tracking/0.json  # physics-tracked full body
+```
+
+On Windows run `ArcViewer.exe`. On macOS run `ArcViewer.app/Contents/MacOS/ArcViewer`, after running `xattr -dr com.apple.quarantine ArcViewer.app` once because the app isn't notarized. The viewer downloads the map from BeatSaver and selects the difficulty the motion was generated for. Press space to play and drag the timeline to scrub. The JSON files are self-contained, so you can copy them to another computer to watch them there.
+
+The viewer is a fork of [ArcViewer](https://github.com/AllPoland/ArcViewer), so its usual settings and camera controls apply.
+
 ## Notes
 
 * Run commands from the repository root.
-* Visualization code is not yet included.

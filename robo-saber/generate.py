@@ -1,5 +1,6 @@
 import glob
 import io
+import json
 import os
 import tarfile
 from argparse import ArgumentParser, Namespace
@@ -17,6 +18,7 @@ from beaty_common.bsmg_xror_utils import get_cbo_np, load_cbo_and_3p, open_beatm
 from beaty_common.data_utils import device as eval_device, sample_for_training
 from beaty_common.eval_utils import evaluate_3p_on_map
 from beaty_common.gen_utils import PlaystyleTensors, generate_3p_from_style_embeddings
+from beaty_common.pose_utils import sixd_to_quat
 from beaty_common.torch_nets import CondTransformerGSVAE, GameplayEncoder, ReplayTensors, SentinelPredictor, TransformerGSVAE
 from beaty_common.train_utils import nanpad_collate_fn
 from vendor.xror.xror import XROR
@@ -365,6 +367,20 @@ def write_record(
         group=str(outputs_written),
         engine="h5netcdf",
     )
+
+    # Same record for the viewer: xyz + xyzw quaternion per head/hand, at 60 fps
+    three_p = three_p_array[0, 0]
+    viewer_dir = os.path.splitext(nc_out_path)[0]
+    os.makedirs(viewer_dir, exist_ok=True)
+    with open(f"{viewer_dir}/{outputs_written}.json", "w") as f:
+        json.dump(
+            {
+                "gen3p": np.round(np.concatenate([three_p[..., :3], sixd_to_quat(three_p[..., 3:])], axis=-1), 6).tolist(),
+                "song_hash": record.target.song_hash,
+                "difficulty": record.target.difficulty,
+            },
+            f,
+        )
 
 
 def main(args: Namespace) -> None:
