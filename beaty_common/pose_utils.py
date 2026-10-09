@@ -26,6 +26,84 @@ def quat_to_sixd(quat: np.ndarray or torch.Tensor) -> np.ndarray or torch.Tensor
     return sixd
 
 
+def unity_to_zup(xyz: np.ndarray or torch.Tensor, quat: np.ndarray or torch.Tensor):
+    my_pos = xyz * 1
+    my_pos[..., [0, 1, 2]] = my_pos[..., [2, 0, 1]]
+    my_pos[..., 1] *= -1
+
+    my_quat = quat * 1
+    my_quat[..., [0, 1, 2, 3]] = my_quat[..., [2, 0, 1, 3]]
+    my_quat[..., [0, 2]] *= -1
+
+    return my_pos, my_quat
+
+
+def zup_to_unity(xyz: np.ndarray or torch.Tensor, quat: np.ndarray or torch.Tensor):
+    my_pos = xyz
+    my_pos[..., 1] *= -1
+    my_pos[..., [0, 1, 2]] = my_pos[..., [1, 2, 0]]
+
+    my_quat = quat
+    my_quat[..., [0, 2]] *= -1
+    my_quat[..., [0, 1, 2, 3]] = my_quat[..., [1, 2, 0, 3]]
+
+    return my_pos, my_quat
+
+
+def rotate_thumb_to_fingertip(quat: np.ndarray) -> np.ndarray:
+    my_lhand_rot = Rotation.from_quat(quat[..., 1, :].reshape((-1, 4)))
+
+    my_lhand_eul = my_lhand_rot.as_euler("ZYX", degrees=True)
+    my_lhand_eul[..., -1] -= 90
+    my_lhand_rot = Rotation.from_euler("ZYX", my_lhand_eul, degrees=True)
+
+    my_lhand_eul = my_lhand_rot.as_euler("XYZ", degrees=True)
+    my_lhand_eul[..., -1] -= 90
+    my_lhand_rot = Rotation.from_euler("XYZ", my_lhand_eul, degrees=True)
+
+    quat[..., 1, :] = my_lhand_rot.as_quat()
+
+    my_rhand_rot = Rotation.from_quat(quat[..., 2, :].reshape((-1, 4)))
+
+    my_rhand_eul = my_rhand_rot.as_euler("ZYX", degrees=True)
+    my_rhand_eul[..., -1] += 90
+    my_rhand_rot = Rotation.from_euler("ZYX", my_rhand_eul, degrees=True)
+
+    my_rhand_eul = my_rhand_rot.as_euler("XYZ", degrees=True)
+    my_rhand_eul[..., -1] += 90
+    my_rhand_rot = Rotation.from_euler("XYZ", my_rhand_eul, degrees=True)
+
+    quat[..., 2, :] = my_rhand_rot.as_quat()
+    return quat
+
+
+def rotate_fingertip_to_thumb(quat: np.ndarray) -> np.ndarray:
+    my_lhand_rot = Rotation.from_quat(quat[..., 1, :].reshape((-1, 4)))
+
+    my_lhand_eul = my_lhand_rot.as_euler("XYZ", degrees=True)
+    my_lhand_eul[..., -1] += 90
+    my_lhand_rot = Rotation.from_euler("XYZ", my_lhand_eul, degrees=True)
+
+    my_lhand_eul = my_lhand_rot.as_euler("ZYX", degrees=True)
+    my_lhand_eul[..., -1] += 90
+    my_lhand_rot = Rotation.from_euler("ZYX", my_lhand_eul, degrees=True)
+
+    quat[..., 1, :] = my_lhand_rot.as_quat()
+
+    my_rhand_rot = Rotation.from_quat(quat[..., 2, :].reshape((-1, 4)))
+
+    my_rhand_eul = my_rhand_rot.as_euler("XYZ", degrees=True)
+    my_rhand_eul[..., -1] -= 90
+    my_rhand_rot = Rotation.from_euler("XYZ", my_rhand_eul, degrees=True)
+
+    my_rhand_eul = my_rhand_rot.as_euler("ZYX", degrees=True)
+    my_rhand_eul[..., -1] -= 90
+    my_rhand_rot = Rotation.from_euler("ZYX", my_rhand_eul, degrees=True)
+
+    quat[..., 2, :] = my_rhand_rot.as_quat()
+    return quat
+
+
 def slerp(q0: torch.Tensor, q1: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     cos_half_theta = torch.sum(q0 * q1, dim=-1)
 
@@ -47,6 +125,25 @@ def slerp(q0: torch.Tensor, q1: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     new_q = torch.where(torch.abs(cos_half_theta) >= 1, q0, new_q)
 
     return new_q
+
+
+def interpolate_xyzquat(keypoints: torch.Tensor, stride: int) -> torch.Tensor:
+    device = keypoints.device
+    if keypoints.shape[2] == 1:
+        return keypoints[:, :, :, None].repeat_interleave(stride, -3)
+    lefts = keypoints[:, :, :-1]
+    rights = keypoints[:, :, 1:]
+    left_xyz = lefts[..., :3]
+    right_xyz = rights[..., :3]
+    lerp_t = torch.linspace(0, 1, stride + 1, device=device)[1:]
+    interpolated_xyz = left_xyz[:, :, :, None] * (1 - lerp_t[None, None, None, :, None, None]) + right_xyz[:, :, :, None] * lerp_t[None, None, None, :, None, None]
+    left_quat = lefts[..., 3:]
+    right_quat = rights[..., 3:]
+    slerp_t = torch.linspace(0, 1, stride + 1, device=device)[1:]
+    interpolated_quat = slerp(left_quat[:, :, :, None], right_quat[:, :, :, None], slerp_t[None, None, None, :, None, None])
+    interpolated = torch.cat([interpolated_xyz, interpolated_quat], dim=-1)
+    interpolated = interpolated.flatten(2, 3)
+    return interpolated
 
 
 def interpolate_xyzsixd(keypoints: torch.Tensor, stride: int) -> torch.Tensor:

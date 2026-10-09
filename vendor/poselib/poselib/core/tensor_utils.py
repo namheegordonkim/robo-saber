@@ -7,6 +7,7 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
+from collections import OrderedDict
 from .backend import Serializable
 import torch
 
@@ -29,3 +30,16 @@ class TensorUtils(Serializable):
         :rtype: OrderedDict
         """
         return NotImplemented
+
+def tensor_to_dict(x):
+    """ Construct an ordered dictionary from the object
+    
+    :rtype: OrderedDict
+    """
+    x_np = x.numpy()
+    return {
+        "arr": x_np,
+        "context": {
+            "dtype": x_np.dtype.name
+        }
+    }

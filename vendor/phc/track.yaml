@@ -1,0 +1,223 @@
+# PHC Hydra config composed with: learning=im_big2 env=env_vr robot=smpl_humanoid
+# exp_name=phc_prim_vr test=True no_log=True env.num_envs=1 (then train=false).
+project_name: PHC
+notes: Default Notes
+exp_name: phc_prim_vr
+headless: true
+seed: 0
+no_log: true
+resume_str: null
+num_threads: 64
+test: true
+output_path: output/HumanoidIm/phc_prim_vr
+torch_deterministic: false
+epoch: 0
+im_eval: false
+horovod: false
+rl_device: cuda:0
+device: cuda
+device_id: 0
+metadata: false
+play: true
+train: false
+server_mode: false
+has_eval: true
+no_virtual_display: false
+render_o3d: false
+debug: false
+follow: false
+add_proj: false
+real_traj: false
+env:
+  task: HumanoidIm
+  project_name: PHC
+  notes: VR modell, three point tracking
+  motion_file: ''
+  num_envs: 1
+  env_spacing: 5
+  episode_length: 300
+  is_flag_run: false
+  enable_debug_vis: false
+  fut_tracks: false
+  self_obs_v: 1
+  obs_v: 6
+  auto_pmcp: false
+  auto_pmcp_soft: true
+  cycle_motion: false
+  hard_negative: false
+  min_length: 5
+  kp_scale: 1
+  power_reward: true
+  shape_resampling_interval: 500
+  control_mode: isaac_pd
+  power_scale: 1.0
+  controlFrequencyInv: 2
+  stateInit: Random
+  hybridInitProb: 0.5
+  numAMPObsSteps: 10
+  local_root_obs: true
+  root_height_obs: true
+  keyBodies:
+  - R_Ankle
+  - L_Ankle
+  - R_Wrist
+  - L_Wrist
+  contact_bodies:
+  - R_Ankle
+  - L_Ankle
+  - R_Toe
+  - L_Toe
+  resetBodies:
+  - Head
+  - L_Hand
+  - R_Hand
+  trackBodies:
+  - Head
+  - L_Hand
+  - R_Hand
+  terminationHeight: 0.15
+  enableEarlyTermination: true
+  terminationDistance: 0.25
+  numTrajSamples: 3
+  trajSampleTimestepInv: 3
+  enableTaskObs: true
+  plane:
+    staticFriction: 1.0
+    dynamicFriction: 1.0
+    restitution: 0.0
+robot:
+  humanoid_type: smpl
+  bias_offset: false
+  has_self_collision: true
+  has_mesh: false
+  has_jt_limit: false
+  has_dof_subset: true
+  has_upright_start: true
+  has_smpl_pd_offset: false
+  remove_toe: false
+  motion_sym_loss: false
+  sym_loss_coef: 1
+  big_ankle: true
+  has_shape_obs: false
+  has_shape_obs_disc: false
+  has_shape_variation: false
+  masterfoot: false
+  freeze_toe: false
+  freeze_hand: false
+  box_body: true
+  real_weight: true
+  real_weight_porpotion_capsules: true
+  real_weight_porpotion_boxes: true
+  asset:
+    assetRoot: /
+    assetFileName: mjcf/smpl_humanoid.xml
+learning:
+  params:
+    seed: 0
+    algo:
+      name: im_amp
+    model:
+      name: amp
+    network:
+      name: amp
+      separate: true
+      space:
+        continuous:
+          mu_activation: None
+          sigma_activation: None
+          mu_init:
+            name: default
+          sigma_init:
+            name: const_initializer
+            val: -2.9
+          fixed_sigma: true
+          learn_sigma: false
+      mlp:
+        units:
+        - 2048
+        - 1536
+        - 1024
+        - 1024
+        - 512
+        - 512
+        activation: silu
+        d2rl: false
+        initializer:
+          name: default
+        regularizer:
+          name: None
+      disc:
+        units:
+        - 1024
+        - 512
+        activation: relu
+        initializer:
+          name: default
+    load_checkpoint: false
+    config:
+      name: Humanoid
+      env_name: rlgpu
+      multi_gpu: false
+      ppo: true
+      mixed_precision: false
+      normalize_input: true
+      normalize_value: true
+      reward_shaper:
+        scale_value: 1
+      normalize_advantage: true
+      gamma: 0.99
+      tau: 0.95
+      learning_rate: 2.0e-05
+      lr_schedule: constant
+      score_to_win: 20000
+      max_epochs: 10000000000
+      save_best_after: 100
+      save_frequency: 10000
+      print_stats: false
+      save_intermediate: true
+      entropy_coef: 0.0
+      truncate_grads: true
+      grad_norm: 50.0
+      e_clip: 0.2
+      horizon_length: 32
+      minibatch_size: 4096
+      mini_epochs: 6
+      critic_coef: 5
+      clip_value: false
+      bounds_loss_coef: 10
+      amp_obs_demo_buffer_size: 200000
+      amp_replay_buffer_size: 200000
+      amp_replay_keep_prob: 0.01
+      amp_batch_size: 512
+      amp_minibatch_size: 4096
+      disc_coef: 5
+      disc_logit_reg: 0.01
+      disc_grad_penalty: 5
+      disc_reward_scale: 2
+      disc_weight_decay: 0.0001
+      normalize_amp_input: true
+      task_reward_w: 1.0
+      disc_reward_w: 0.0
+      player:
+        games_num: 50000000
+sim:
+  sim_device: cuda:0
+  pipeline: gpu
+  graphics_device_id: 0
+  subscenes: 0
+  slices: 0
+  use_flex: false
+  substeps: 2
+  physx:
+    num_threads: 4
+    solver_type: 1
+    num_position_iterations: 4
+    num_velocity_iterations: 0
+    contact_offset: 0.02
+    rest_offset: 0.0
+    bounce_threshold_velocity: 0.2
+    max_depenetration_velocity: 10.0
+    default_buffer_size_multiplier: 10.0
+  flex:
+    num_inner_iterations: 10
+    warm_start: 0.25

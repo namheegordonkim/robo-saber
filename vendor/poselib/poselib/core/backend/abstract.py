@@ -5,7 +5,8 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-from abc import abstractmethod, abstractclassmethod
+from abc import ABCMeta, abstractmethod, abstractclassmethod
+from collections import OrderedDict
 import json
 
 import numpy as np
@@ -22,6 +23,11 @@ def register(name):
         return tensor_cls
 
     return core
+
+
+def _get_cls(name):
+    global TENSOR_CLASS
+    return TENSOR_CLASS[name]
 
 
 class NumpyEncoder(json.JSONEncoder):

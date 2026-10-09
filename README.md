@@ -31,6 +31,7 @@ The first run requires internet access. Generation currently assumes CUDA, so ru
 * [x] Inference code
 * [ ] Visualization code
 * [x] Training code
+* [x] Physics-based tracking code
 
 ## Requirements
 
@@ -70,6 +71,9 @@ This downloads:
 * `data/heldout_player_maps.csv`
 * `data/placeholder_3p.txt`
 * `data/placeholder_3p_sixd.txt`
+* `models/phc.pkl`
+* `data/phc/sample_data/amass_isaac_standing_upright_slim.pkl`
+* `data/phc/sample_data/amass_isaac_gender_betas_unique.pkl`
 
 To override the default Snakemake inputs from `config.yaml`:
 
@@ -168,6 +172,45 @@ pixi run python robo-saber/generate.py --clean_models_bundle out/train/pretraine
 ```
 
 Operational options are `--checkpoint`, `--out-dir`, `--total-batches` (the total target, including resumed updates), `--microbatch-size` (default 16), and `--workers` (default 4, capped by available CPUs). Reduce the microbatch size to fit GPU memory; the optimizer batch remains 128. Resume restores model/optimizer/RNG state and restarts streaming with a new deterministic pass seed. Prefetched records are not restored. This reproduces the released architecture and optimization recipe; the reconstructed split and streaming sampler do not reproduce the historical run bit for bit.
+
+## Physics-Based Tracking
+
+The `track` rule turns the generated 3-point trajectories in `out/gen3p.nc` into full-body, physics-based motion by tracking them with a VR tracking controller from [PHC](https://github.com/ZhengyiLuo/PHC) in Isaac Gym Preview 4. Isaac Gym requires Python 3.8, so this step runs in a separate Pixi environment, `phc`, defined in `pyproject.toml`.
+
+Isaac Gym and the SMPL body model cannot be redistributed, so download them yourself once:
+
+1. Download Isaac Gym Preview 4 from [NVIDIA](https://developer.nvidia.com/isaac-gym), extract it anywhere, and install it into the `phc` environment. The first import builds a small PyTorch extension, so a C++ compiler must be available.
+
+   ```bash
+   pixi install -e phc
+   pixi run -e phc pip install -e /path/to/isaacgym/python
+   ```
+
+2. Download SMPL v1.1.0 (Python, 10 shape PCs) from the [SMPL website](https://smpl.is.tue.mpg.de/) and rename `basicmodel_neutral_lbs_10_207_0_v1.1.0.pkl`, `basicmodel_m_lbs_10_207_0_v1.1.0.pkl`, and `basicmodel_f_lbs_10_207_0_v1.1.0.pkl` to:
+
+   ```text
+   data/phc/smpl/SMPL_NEUTRAL.pkl
+   data/phc/smpl/SMPL_MALE.pkl
+   data/phc/smpl/SMPL_FEMALE.pkl
+   ```
+
+Then, after `generate`:
+
+```bash
+pixi run snakemake track
+```
+
+`prepare` also downloads the tracking policy `models/phc.pkl` and two PHC sample files under `data/phc/sample_data/`. The script can be run directly with `pixi run -e phc python robo-saber/track.py`, which accepts `--gen3p_path` (default `out/gen3p.nc`), `--out_path` (default `out/tracking.nc`), and `--checkpoint` (default `models/phc.pkl`).
+
+`out/tracking.nc` has one NetCDF group per group in `out/gen3p.nc`, with the same name and attributes:
+
+* `pos` `(frame, 3)`: root position
+* `rots` `(frame, 24, 4)`: local joint rotations of the SMPL humanoid as `xyzw` quaternions
+* `phy3p` `(frame, 3, 7)`: simulated head, left hand, and right hand as position plus `xyzw` quaternion
+
+Everything is at 60 fps in the same coordinate frame as `gen3p.nc`. The controller runs at 30 Hz and is upsampled, so each group is about 8 frames shorter than its input.
+
+`vendor/phc` is a trimmed, headless subset of PHC ([Luo et al., ICCV 2023](https://zhengyiluo.github.io/PHC/)) under its BSD 3-Clause Clear license; see `vendor/phc/LICENSE`.
 
 ## Notes
 

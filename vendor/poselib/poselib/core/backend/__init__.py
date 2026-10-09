@@ -1,3 +1,3 @@
-from .abstract import Serializable as Serializable
+from .abstract import Serializable
 
-from .logger import logger as logger
+from .logger import logger
